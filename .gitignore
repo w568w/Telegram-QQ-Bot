@@ -11,3 +11,12 @@ wheels/
 
 # Environment variables
 .env
+
+# Bot runtime files
+test.py
+runtime
+ffmpeg-*
+*.tgs
+*.webm
+*.gif
+*.db
