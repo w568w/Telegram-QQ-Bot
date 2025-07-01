@@ -13,6 +13,8 @@ Telegram-QQ-Bot 是一个机器人，用于将 Telegram 群组和 QQ 群互通�
 * Python 3.13+
 * uv 包管理工具
 * 已正确配置 napcat 的正向 WebSocket 服务器连接
+* 已安装 FFmpeg（用于处理媒体文件）
+  * 如果你不方便安装 FFmpeg，可以从 [FFmpeg Static Builds](https://johnvansickle.com/ffmpeg/) 下载预编译的二进制文件、解压，并将 `ffmpeg` 的路径设置到环境变量 `FFMPEG_EXECUTABLE` 中。
 
 ## 安装
 
