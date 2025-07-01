@@ -184,6 +184,19 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
                 }
             }
         )
+    if message.animation is not None:
+        # 处理动画消息（GIF/WebM）
+        animation_file = await message.animation.get_file()
+        img_data = await get_converted_image_with_cache(animation_file, animation_file.file_path, message.animation.file_unique_id)
+        single_qq_msg.append(
+            {
+                "type": "image",
+                "data": {
+                    "file": encode_bytearray_to_base64_uri(img_data),
+                    "sub_type": 1,
+                }
+            }
+        )
     if len(message.photo) > 0:
         # 处理图片消息
         photo = message.photo[-1]
@@ -257,8 +270,8 @@ async def get_converted_image_with_cache(file_obj: telegram.File, file_path: str
     logging.info(f"Cache miss, downloading and converting: {file_unique_id}")
     img_data = await file_obj.download_as_bytearray()
     
-    if file_path.lower().endswith(".webm"):
-        # WebM 转 GIF
+    if file_path.lower().endswith(".webm") or file_path.lower().endswith(".mp4"):
+        # WebM/MP4 转 GIF
         ffmpeg = (
             FFmpeg(FFMPEG_EXECUTABLE)
             .input("pipe:0")
