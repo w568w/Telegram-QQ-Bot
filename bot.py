@@ -545,7 +545,9 @@ async def qq_message_handler(message: websockets.Data):
                             tg_msg.text_context += f"链接：{url}\n"
                     except json.JSONDecodeError:
                         tg_msg.text_context += f"[无法解析的 JSON 卡片]\n```json\n{json.dumps(json_obj, indent=2, ensure_ascii=False)}\n```"
-                    
+                case "face":
+                    face_id: str = msg.get("data", {}).get("id")
+                    tg_msg.text_context += f" [表情 {face_id}] "
     
     # 将回复信息添加到消息开头
     if reply_info_text:
