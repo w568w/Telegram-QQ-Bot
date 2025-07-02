@@ -517,10 +517,31 @@ async def qq_message_handler(message: websockets.Data):
                     try:
                         # 解析以进行格式化
                         json_obj = json.loads(json_str)
-                        # 处理 JSON 卡片消息，这里直接把它当作代码块处理
-                        tg_msg.text_context += f"\n```json\n{json.dumps(json_obj, indent=2, ensure_ascii=False)}\n```"
+                        # 处理 JSON 卡片消息，尝试解析其中的信息
+                        meta = json_obj["meta"]
+                        info_data = meta.get(list(meta.keys())[0], {})
+                        title = info_data.get("title", "")
+                        URL_KEYS = ["jumpUrl", "qqdocurl", "url"]
+                        url = ""
+                        for key in URL_KEYS:
+                            if key in info_data:
+                                url = info_data[key]
+                                break
+                        if len(url) > 0:
+                            url = await parse_b23_url_if_any(url)
+                        desc = info_data.get("desc", "")
+                        tag = info_data.get("tag", "")
+                        tg_msg.text_context += "[卡片分享]\n"
+                        if len(title) > 0:
+                            tg_msg.text_context += f"标题：{title}\n"
+                        if len(desc) > 0:
+                            tg_msg.text_context += f"描述：{desc}\n"
+                        if len(tag) > 0:
+                            tg_msg.text_context += f"标签：{tag}\n"
+                        if len(url) > 0:
+                            tg_msg.text_context += f"链接：{url}\n"
                     except json.JSONDecodeError:
-                        tg_msg.text_context += "[无法解析的 JSON 卡片]"
+                        tg_msg.text_context += f"[无法解析的 JSON 卡片]\n```json\n{json.dumps(json_obj, indent=2, ensure_ascii=False)}\n```"
                     
     
     # 将回复信息添加到消息开头
@@ -603,6 +624,29 @@ async def websocket_handler():
                     )
                     cur_waiting_tasks[echo] = completion
                     ws_send_task_queue_recv = asyncio.create_task(ws_send_task_queue.get()) # 重新创建发送任务
+
+async def parse_b23_url_if_any(url: str) -> str:
+    """
+    纯工具函数，解析 Bilibili 视频 URL，返回视频的真实地址
+    如果 URL 不是 Bilibili 视频链接，则直接返回原始 URL，因此是安全的
+    """
+    if "b23.tv" not in url: return url
+    # 设置 httpx 客户端，不要走代理
+    async with httpx.AsyncClient(trust_env=False) as client:
+        USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3"
+        REFERER = "https://www.bilibili.com/"
+        response = await client.head(url, follow_redirects=True, headers={
+            "User-Agent": USER_AGENT,
+            "Referer": REFERER
+        })
+        if response.status_code == 200:
+            # 返回最终的重定向 URL
+            resolved_url = response.url
+            # 清除查询参数
+            return str(resolved_url.copy_with(params={}))
+        else:
+            logging.warning(f"Failed to resolve Bilibili URL {url}, status code: {response.status_code}")
+            return url
 
 app.add_handlers(
     [
