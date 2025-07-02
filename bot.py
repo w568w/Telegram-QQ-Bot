@@ -476,9 +476,12 @@ async def qq_message_handler(message: websockets.Data):
         return
     
     default_tg_chat_id = group_ids[0]
-    messages = message_data.get("message", [])
+    sender = message_data.get("sender", {})
+    sender_name = sender.get("card", "")
+    if len(sender_name) == 0:
+        sender_name = sender.get("nickname", "[???]")
     # 解析消息
-    tg_msg = ConstructedTelegramMessageFromQQ(sender_name=message_data.get("sender", {}).get("nickname", "[???]"))
+    tg_msg = ConstructedTelegramMessageFromQQ(sender_name=sender_name)
     tg_sent_msgs: list[Optional[Message]] = []
     reply_info_text = ""
     
