@@ -144,6 +144,8 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
                 reply_content = reply_msg.caption[:50] + ("..." if len(reply_msg.caption) > 50 else "")
             elif reply_msg.sticker:
                 reply_content = "[表情]"
+            elif reply_msg.animation:
+                reply_content = "[动画]"
             elif reply_msg.photo:
                 reply_content = "[图片]"
             else:
