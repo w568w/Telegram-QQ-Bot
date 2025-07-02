@@ -5,6 +5,7 @@ description = "Telegram-Channel-to-QQ 是一个 Telegram 频道消息同步转�
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "aiofiles>=24.1.0",
     # required by lottie[gif]
     "cairosvg>=2.8.2",
     "lottie[gif]>=0.7.2",

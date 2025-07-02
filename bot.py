@@ -270,14 +270,28 @@ async def get_converted_image_with_cache(file_obj: telegram.File, file_path: str
     logging.info(f"Cache miss, downloading and converting: {file_unique_id}")
     img_data = await file_obj.download_as_bytearray()
     
-    if file_path.lower().endswith(".webm") or file_path.lower().endswith(".mp4"):
-        # WebM/MP4 转 GIF
+    if file_path.lower().endswith(".webm"):
+        # WebM 转 GIF
         ffmpeg = (
             FFmpeg(FFMPEG_EXECUTABLE)
             .input("pipe:0")
             .output("pipe:1", f="gif")
         )
         converted_data = await ffmpeg.execute(bytes(img_data))
+    elif file_path.lower().endswith(".mp4"):
+        # MP4 转 GIF
+        # FFMpeg 不支持 MP4 的流式输入，因此需要先保存到临时文件
+        # 见 https://github.com/fluent-ffmpeg/node-fluent-ffmpeg/issues/932#issuecomment-699675713
+        from aiofiles.tempfile import NamedTemporaryFile
+        async with NamedTemporaryFile(suffix=".mp4") as temp_file:
+            await temp_file.write(img_data)
+            temp_file_path = temp_file.name
+            ffmpeg = (
+                FFmpeg(FFMPEG_EXECUTABLE)
+                .input(temp_file_path)
+                .output("pipe:1", f="gif")
+            )
+            converted_data = await ffmpeg.execute()
     elif file_path.lower().endswith(".tgs"):
         # TGS 转 GIF
         def process_tgs_to_gif(data: bytes) -> bytes:
