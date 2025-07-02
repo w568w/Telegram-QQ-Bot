@@ -355,6 +355,22 @@ async def qq_get_msg_info(qq_msg_id: int) -> dict[str, Any]:
     result = await completion
     return result
 
+async def qq_get_forward_msg_info(forward_list_id: str) -> dict[str, Any]:
+    """获取 QQ 转发消息的详细内容"""
+    logging.info(f"\n\nGetting forward msg ID: {forward_list_id}\n\n")
+    action = "get_forward_msg"
+    params = {
+        "message_id": forward_list_id,
+    }
+    echo = str(uuid.uuid4())
+    loop = asyncio.get_running_loop()
+    completion = loop.create_future()
+    # 将消息发送到 WebSocket 队列，在 websocket_handler 中处理
+    await ws_send_task_queue.put((action, params, echo, completion))
+    # 等待结果
+    result = await completion
+    return result
+
 async def debug_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """调试处理函数，打印接收到的更新"""
     logging.info(f"\n\nReceived update: {update}\n\n")
@@ -426,42 +442,63 @@ class ConstructedTelegramMessageFromQQ:
                 reply_parameters=reply_parameters,
             )
         
-    
+def render_qq_message_to_plain_markdown(
+    messages: str | list[dict[str, Any]]
+) -> str:
+    """将单条 QQ 消息中的段转换为纯文本 Markdown 格式"""
+    if isinstance(messages, str):
+        return messages
+    reply_text = ""
+    for msg in messages:
+        match msg.get("type"):
+            case "text":
+                text = msg.get("data", {}).get("text", "")
+                reply_text += text
+            case "image":
+                # 如果是图片，添加图片链接
+                image_url = msg.get("data", {}).get("url", "")
+                if image_url:
+                    reply_text += f" [图片]({image_url}) "
+            case "at":
+                at_qq_id_or_all = msg.get("data", {}).get("qq", "")
+                reply_text += f"@{at_qq_id_or_all} "
+            case "json":
+                reply_text += "[JSON 卡片]"
+            case _:
+                reply_text += f"[未知类型消息: {msg.get('type', 'unknown')}]"
+    return reply_text
+
 def render_qq_message_to_reply_text(
-    getmsg_raw_response: dict[str, Any]
+    messages: list[dict[str, Any]]
 ) -> str:
     """将 QQ 消息的原始响应转换为回复文本"""
-    if "message" not in getmsg_raw_response:
-        logging.warning(f"getmsg_raw_response does not contain 'message': {getmsg_raw_response}")
-        return "[无法获取消息内容]"
-    
     sender = getmsg_raw_response.get("sender", {})
     sender_name = sender.get("card", "")
     if len(sender_name) == 0:
         sender_name = sender.get("nickname", "[???]")
     messages = getmsg_raw_response["message"]
-    reply_text = ""
-
-    if isinstance(messages, str):
-        # 如果消息是字符串，直接使用
-        reply_text = messages
-    elif isinstance(messages, list):
-        for msg in messages:
-            match msg.get("type"):
-                case "text":
-                    text = msg.get("data", {}).get("text", "")
-                    reply_text += text
-                case "image":
-                    # 如果是图片，添加图片链接
-                    image_url = msg.get("data", {}).get("url", "")
-                    if image_url:
-                        reply_text += f" [图片]({image_url}) "
-                case "at":
-                    at_qq_id_or_all = msg.get("data", {}).get("qq", "")
-                    reply_text += f"@{at_qq_id_or_all} "
-                case "json":
-                    reply_text += "[JSON 卡片]"
+    reply_text = render_qq_message_to_plain_markdown(messages)
     return f"[回复 {sender_name}: {reply_text.strip()}]\n"
+
+def render_qq_forward_message_to_texts(
+    messages: list[dict[str, Any]]
+):
+    """
+    将 QQ 转发消息转换为文本
+
+    :param messages: 转发消息列表，类型为 OB11Message[]
+    """
+    result_text = "[转发消息，完整内容请前往 QQ 查看]\n"
+    for msg in messages:
+        sender = msg.get("sender", {})
+        sender_name: str = sender.get("card", "")
+        if len(sender_name) == 0:
+            sender_name = sender.get("nickname", "[???]")
+        message_content = msg.get("message", [])
+        result_text += f"{sender_name}: "
+        result_text += render_qq_message_to_plain_markdown(message_content)
+        result_text += "\n"
+    return result_text
 
 async def qq_message_handler(message: websockets.Data):
     """处理从 QQ 接收到的消息"""
@@ -549,6 +586,21 @@ async def qq_message_handler(message: websockets.Data):
                             tg_msg.text_context += f"链接：{url}\n"
                     except json.JSONDecodeError:
                         tg_msg.text_context += f"[无法解析的 JSON 卡片]\n```json\n{json.dumps(json_obj, indent=2, ensure_ascii=False)}\n```"
+                case "forward":
+                    # 转发消息，通常是来自其他 QQ 群的消息
+                    forward_list_id: Optional[str] = msg.get("data", {}).get("id")
+                    if forward_list_id is None:
+                        tg_msg.text_context += "[无法解析的转发消息 ID]"
+                    else:
+                        try:
+                            forward_msg_data = await qq_get_forward_msg_info(forward_list_id)
+                            # 只渲染前 5 条消息
+                            tg_msg.text_context += render_qq_forward_message_to_texts(forward_msg_data.get("data", {}).get("messages", [])[:5])
+                        except Exception as e:
+                            logging.error(f"Failed to get forward message info for ID {forward_list_id}: {e}")
+                            tg_msg.text_context += "[无法获取转发消息内容]"
+                            continue
+                    
                 case "face":
                     face_id: str = msg.get("data", {}).get("id")
                     tg_msg.text_context += f" [表情 {face_id}] "
