@@ -469,7 +469,7 @@ def render_qq_message_to_plain_markdown(
     return reply_text
 
 def render_qq_message_to_reply_text(
-    messages: list[dict[str, Any]]
+    getmsg_raw_response: dict[str, Any]
 ) -> str:
     """将 QQ 消息的原始响应转换为回复文本"""
     sender = getmsg_raw_response.get("sender", {})
