@@ -604,6 +604,15 @@ async def qq_message_handler(message: websockets.Data):
                 case "face":
                     face_id: str = msg.get("data", {}).get("id")
                     tg_msg.text_context += f" [表情 {face_id}] "
+                case "record":
+                    tg_msg.text_context += " [语音] "
+                case "video":
+                    tg_msg.text_context += " [视频] "
+                case "file":
+                    tg_msg.text_context += " [文件] "
+                case _:
+                    tg_msg.text_context += f"[未知类型消息: {msg.get('type', 'unknown')}] "
+                
     
     # 将回复信息添加到消息开头
     if reply_info_text:
