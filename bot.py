@@ -435,7 +435,10 @@ def render_qq_message_to_reply_text(
         logging.warning(f"getmsg_raw_response does not contain 'message': {getmsg_raw_response}")
         return "[无法获取消息内容]"
     
-    sender_name = getmsg_raw_response.get("sender", {}).get("nickname", "[???]")
+    sender = getmsg_raw_response.get("sender", {})
+    sender_name = sender.get("card", "")
+    if len(sender_name) == 0:
+        sender_name = sender.get("nickname", "[???]")
     messages = getmsg_raw_response["message"]
     reply_text = ""
 
