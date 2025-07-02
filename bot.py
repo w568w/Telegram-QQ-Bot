@@ -476,6 +476,7 @@ async def qq_message_handler(message: websockets.Data):
         return
     
     default_tg_chat_id = group_ids[0]
+    messages = message_data.get("message", [])
     sender = message_data.get("sender", {})
     sender_name = sender.get("card", "")
     if len(sender_name) == 0:
