@@ -58,11 +58,25 @@ class DB:
         qq_message_id: int
         tg_message_id: int
     
+    @dataclass
+    class SavedUserMapping:
+        CREATE_TBL: ClassVar[str] = """CREATE TABLE IF NOT EXISTS saved_qq_mappings_v2 (
+            qq_user_id INTEGER NOT NULL,
+            tg_user_id INTEGER NOT NULL,
+            tg_username TEXT,
+            PRIMARY KEY (qq_user_id, tg_user_id)
+        );
+        """
+        qq_user_id: int
+        tg_user_id: int
+        tg_username: Optional[str] = None
+
     def __init__(self, db_path: str):
         self.connection = sqlite3.connect(db_path)
         self.connection.row_factory = sqlite3.Row
         with self.connection:
             self.connection.execute(self.SavedMessageMapping.CREATE_TBL)
+            self.connection.execute(self.SavedUserMapping.CREATE_TBL)
 
     def map_message(self, mapping: SavedMessageMapping):
         """将 QQ 消息和 TG 消息进行映射"""
@@ -98,6 +112,61 @@ class DB:
             qq_message_id=row["qq_message_id"],
             tg_message_id=row["tg_message_id"],
         )
+        
+    def bind_user(self, mapping: SavedUserMapping):
+        """绑定 QQ 用户和 TG 用户"""
+        with self.connection:
+            # 先删除已有的绑定关系
+            self.connection.execute(
+                "DELETE FROM saved_qq_mappings_v2 WHERE tg_user_id = ?",
+                (mapping.tg_user_id,),
+            )
+            # 插入新的绑定关系
+            self.connection.execute(
+                "INSERT INTO saved_qq_mappings_v2 (qq_user_id, tg_user_id, tg_username) VALUES (?, ?, ?)",
+                (mapping.qq_user_id, mapping.tg_user_id, mapping.tg_username),
+            )
+
+    def get_user_by_id(self, id: int, type_: Literal["qq", "tg"]) -> Optional[SavedUserMapping]:
+        """根据 ID 获取绑定的用户"""
+        cursor = self.connection.cursor()
+        if type_ == "qq":
+            cursor.execute(
+                "SELECT * FROM saved_qq_mappings_v2 WHERE qq_user_id = ?",
+                (id,),
+            )
+        elif type_ == "tg":
+            cursor.execute(
+                "SELECT * FROM saved_qq_mappings_v2 WHERE tg_user_id = ?",
+                (id,),
+            )
+        else:
+            raise ValueError("type_ must be either 'qq' or 'tg'")
+
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        return self.SavedUserMapping(
+            qq_user_id=row["qq_user_id"],
+            tg_user_id=row["tg_user_id"],
+            tg_username=row["tg_username"],
+        )
+
+    def get_user_by_username(self, username: str) -> Optional[SavedUserMapping]:
+        """根据 Telegram 用户名获取绑定的用户"""
+        cursor = self.connection.cursor()
+        cursor.execute(
+            "SELECT * FROM saved_qq_mappings_v2 WHERE tg_username = ?",
+            (username,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        return self.SavedUserMapping(
+            qq_user_id=row["qq_user_id"],
+            tg_user_id=row["tg_user_id"],
+            tg_username=row["tg_username"],
+        )
 
     def close(self):
         """关闭数据库连接"""
@@ -111,6 +180,36 @@ app = ApplicationBuilder().token(bot_token).build()
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     assert update.message is not None
     await update.message.reply_text("Hello!")
+
+async def bind_qq_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """处理 /bindqq 命令"""
+    assert update.message is not None
+    message = update.message
+    
+    # 检查是否在允许的群组中
+    if message.chat.id not in group_ids:
+        await message.reply_text("此命令只能在指定的群组中使用。")
+        return
+    
+    # 检查参数
+    if not context.args or len(context.args) != 1:
+        await message.reply_text("使用方法: /bindqq <QQ 号>")
+        return
+    
+    try:
+        qq_id = int(context.args[0])
+    except ValueError:
+        await message.reply_text("QQ 号必须是数字。")
+        return
+    
+    # 获取用户信息
+    tg_user_id = message.from_user.id
+    tg_username = message.from_user.username
+    
+    # 保存绑定关系
+    db.bind_user(DB.SavedUserMapping(qq_user_id=qq_id, tg_user_id=tg_user_id, tg_username=tg_username))
+    
+    await message.reply_text(f"已成功绑定 QQ 号 {qq_id} 到您的 Telegram 账号。")
 
 async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logging.info(f"\n\nReceived update: {update}\n\n")
@@ -212,6 +311,93 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
                 }
             }
         )
+    
+    # 处理文本消息和其中实体
+    if message.text is not None:
+        # 按实体位置切割文本
+        text_segments = []
+        last_offset = 0
+        
+        # 按照实体的偏移量排序
+        sorted_entities = sorted(message.entities or [], key=lambda e: e.offset)
+        
+        for entity in sorted_entities:
+            # 添加实体前的文本
+            if entity.offset > last_offset:
+                text_segments.append({
+                    "type": "text",
+                    "content": message.text[last_offset:entity.offset]
+                })
+            
+            # 处理实体
+            if entity.type == "mention":
+                # 处理 @username 格式
+                mentioned_username = message.text[entity.offset:entity.offset + entity.length]
+                username = mentioned_username[1:]  # 去掉 @ 符号
+                user_mapping = db.get_user_by_username(username)
+                if user_mapping:
+                    text_segments.append({
+                        "type": "at",
+                        "qq_id": str(user_mapping.qq_user_id)
+                    })
+                else:
+                    text_segments.append({
+                        "type": "text",
+                        "content": mentioned_username
+                    })
+            elif entity.type == "text_mention":
+                # 处理直接 mention 用户的情况
+                mentioned_user = entity.user
+                user_mapping = db.get_user_by_id(mentioned_user.id, "tg")
+                if user_mapping:
+                    text_segments.append({
+                        "type": "at",
+                        "qq_id": str(user_mapping.qq_user_id)
+                    })
+                else:
+                    display_name = mentioned_user.first_name
+                    if mentioned_user.last_name:
+                        display_name += f" {mentioned_user.last_name}"
+                    text_segments.append({
+                        "type": "text",
+                        "content": f"@{display_name}"
+                    })
+            else:
+                # 其他类型的实体，保持原文本
+                text_segments.append({
+                    "type": "text",
+                    "content": message.text[entity.offset:entity.offset + entity.length]
+                })
+            
+            last_offset = entity.offset + entity.length
+        
+        # 添加最后剩余的文本
+        if last_offset < len(message.text):
+            text_segments.append({
+                "type": "text",
+                "content": message.text[last_offset:]
+            })
+        
+        # 如果没有实体，直接添加整个文本
+        if not text_segments:
+            text_segments.append({
+                "type": "text",
+                "content": message.text
+            })
+        
+        # 将处理后的文本段转换为 QQ 消息格式
+        for segment in text_segments:
+            if segment["type"] == "text" and segment["content"]:
+                single_qq_msg.append({
+                    "type": "text",
+                    "data": {"text": segment["content"]}
+                })
+            elif segment["type"] == "at":
+                single_qq_msg.append({
+                    "type": "at",
+                    "data": {"qq": segment["qq_id"]}
+                })
+
     if message.caption is not None:
         # 处理图片或视频的标题
         single_qq_msg.append(
@@ -222,17 +408,7 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
                 }
             }
         )
-    if message.text is not None:
-        # 处理文本消息
-        single_qq_msg.append(
-            {
-                "type": "text",
-                "data": {
-                    "text": message.text,
-                }
-            }
-        )
-
+    
     qq_message_id = await qq_send_msg_in_group(single_qq_msg)
     # 保存映射关系
     db.map_message(
@@ -425,6 +601,7 @@ class ConstructedTelegramMessageFromQQ:
                     animation=self.image_url,
                     caption=text_with_sender,
                     reply_parameters=reply_parameters,
+                    parse_mode=telegram.constants.ParseMode.MARKDOWN_V2,
                 )
             else:
                 # 如果是静态图片，使用 send_photo
@@ -433,6 +610,7 @@ class ConstructedTelegramMessageFromQQ:
                     photo=self.image_url,
                     caption=text_with_sender,
                     reply_parameters=reply_parameters,
+                    parse_mode=telegram.constants.ParseMode.MARKDOWN_V2,
                 )
         else:
             # 如果没有图片，发送文本消息
@@ -440,6 +618,7 @@ class ConstructedTelegramMessageFromQQ:
                 chat_id=chat_id,
                 text=text_with_sender,
                 reply_parameters=reply_parameters,
+                parse_mode=telegram.constants.ParseMode.MARKDOWN_V2,
             )
         
 def render_qq_message_to_plain_markdown(
@@ -461,7 +640,24 @@ def render_qq_message_to_plain_markdown(
                     reply_text += f" [图片]({image_url}) "
             case "at":
                 at_qq_id_or_all = msg.get("data", {}).get("qq", "")
-                reply_text += f"@{at_qq_id_or_all} "
+                if at_qq_id_or_all == "all":
+                        tg_msg.text_context += "@所有人 "
+                else:
+                    try:
+                        qq_id = int(at_qq_id_or_all)
+                        logging.info(f"Processing QQ ID: {qq_id}")
+                        user_mapping = db.get_user_by_id(qq_id, "qq")
+                        if user_mapping is not None:
+                            # 如果找到绑定的 TG 用户，转换为 TG 的 mention
+                            at_name = user_mapping.tg_username or qq_id
+                            tg_msg.text_context += f"[{at_name}](tg://user?id={user_mapping.tg_user_id}) "
+                        else:
+                            logging.info(f"QQ ID {qq_id} is not bound to any TG user.")
+                            # 如果没有绑定，显示 QQ 号
+                            tg_msg.text_context += f"@{at_qq_id_or_all} "
+                    except ValueError:
+                        logging.error(f"Invalid QQ ID format: {at_qq_id_or_all}, treating as mention")
+                        tg_msg.text_context += f"@{at_qq_id_or_all} "
             case "json":
                 reply_text += "[JSON 卡片]"
             case _:
@@ -546,7 +742,24 @@ async def qq_message_handler(message: websockets.Data):
 
                 case "at":
                     at_qq_id_or_all = msg.get("data", {}).get("qq", "")
-                    tg_msg.text_context += f"@{at_qq_id_or_all} "
+                    if at_qq_id_or_all == "all":
+                        tg_msg.text_context += "@所有人 "
+                    else:
+                        try:
+                            qq_id = int(at_qq_id_or_all)
+                            logging.info(f"Processing QQ ID: {qq_id}")
+                            user_mapping = db.get_user_by_id(qq_id, "qq")
+                            if user_mapping is not None:
+                                # 如果找到绑定的 TG 用户，转换为 TG 的 mention
+                                at_name = user_mapping.tg_username or qq_id
+                                tg_msg.text_context += f"[{at_name}](tg://user?id={user_mapping.tg_user_id}) "
+                            else:
+                                logging.info(f"QQ ID {qq_id} is not bound to any TG user.")
+                                # 如果没有绑定，显示 QQ 号
+                                tg_msg.text_context += f"@{at_qq_id_or_all} "
+                        except ValueError:
+                            logging.error(f"Invalid QQ ID format: {at_qq_id_or_all}, treating as mention")
+                            tg_msg.text_context += f"@{at_qq_id_or_all} "
                 case "text":
                     text = msg.get("data", {}).get("text", "")
                     if len(text) > 0:
@@ -721,6 +934,7 @@ async def parse_b23_url_if_any(url: str) -> str:
 app.add_handlers(
     [
         CommandHandler("start", start),
+        CommandHandler("bindqq", bind_qq_command),
         MessageHandler(filters.ChatType.GROUPS & (~filters.StatusUpdate.ALL), group_message_handler, block=False),
     ]
 )
