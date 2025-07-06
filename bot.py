@@ -11,6 +11,7 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
 )
+from telegram.helpers import mention_markdown
 import logging
 import os
 import asyncio
@@ -210,6 +211,11 @@ async def bind_qq_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db.bind_user(DB.SavedUserMapping(qq_user_id=qq_id, tg_user_id=tg_user_id, tg_username=tg_username))
     
     await message.reply_text(f"已成功绑定 QQ 号 {qq_id} 到您的 Telegram 账号。")
+
+def escape_mdv2(text: str) -> str:
+    """使用 Telegram 的 Markdown V2 语法转义文本"""
+    from telegram.helpers import escape_markdown
+    return escape_markdown(text, version=2)
 
 async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logging.info(f"\n\nReceived update: {update}\n\n")
@@ -587,7 +593,8 @@ class ConstructedTelegramMessageFromQQ:
 
         logging.info(f"Sending message to Telegram chat {chat_id}: text='{self.text_context}', image_url='{self.image_url}'")
 
-        text_with_sender = f"{self.sender_name}: {self.text_context}" if self.text_context else f"{self.sender_name}:"
+        escaped_sender_name = escape_mdv2(self.sender_name)
+        text_with_sender = f"{escaped_sender_name}: {self.text_context}" if self.text_context else f"{escaped_sender_name}:"
         reply_parameters = ReplyParameters(
             message_id=self.reply_tg_message_id
         ) if self.reply_tg_message_id is not None else None
@@ -632,7 +639,7 @@ def render_qq_message_to_plain_markdown(
         match msg.get("type"):
             case "text":
                 text = msg.get("data", {}).get("text", "")
-                reply_text += text
+                reply_text += escape_mdv2(text)
             case "image":
                 # 如果是图片，添加图片链接
                 image_url = msg.get("data", {}).get("url", "")
@@ -641,7 +648,7 @@ def render_qq_message_to_plain_markdown(
             case "at":
                 at_qq_id_or_all = msg.get("data", {}).get("qq", "")
                 if at_qq_id_or_all == "all":
-                        tg_msg.text_context += "@所有人 "
+                        reply_text += escape_mdv2("@所有人 ")
                 else:
                     try:
                         qq_id = int(at_qq_id_or_all)
@@ -650,18 +657,18 @@ def render_qq_message_to_plain_markdown(
                         if user_mapping is not None:
                             # 如果找到绑定的 TG 用户，转换为 TG 的 mention
                             at_name = user_mapping.tg_username or qq_id
-                            tg_msg.text_context += f"[{at_name}](tg://user?id={user_mapping.tg_user_id}) "
+                            reply_text += mention_markdown(user_mapping.tg_user_id, at_name, version=2) + " "
                         else:
                             logging.info(f"QQ ID {qq_id} is not bound to any TG user.")
                             # 如果没有绑定，显示 QQ 号
-                            tg_msg.text_context += f"@{at_qq_id_or_all} "
+                            reply_text += escape_mdv2(f"@{at_qq_id_or_all} ")
                     except ValueError:
                         logging.error(f"Invalid QQ ID format: {at_qq_id_or_all}, treating as mention")
-                        tg_msg.text_context += f"@{at_qq_id_or_all} "
+                        reply_text += escape_mdv2(f"@{at_qq_id_or_all} ")
             case "json":
-                reply_text += "[JSON 卡片]"
+                reply_text += escape_mdv2("[JSON 卡片]")
             case _:
-                reply_text += f"[未知类型消息: {msg.get('type', 'unknown')}]"
+                reply_text += escape_mdv2(f"[未知类型消息: {msg.get('type', 'unknown')}]")
     return reply_text
 
 def render_qq_message_to_reply_text(
@@ -674,7 +681,10 @@ def render_qq_message_to_reply_text(
         sender_name = sender.get("nickname", "[???]")
     messages = getmsg_raw_response["message"]
     reply_text = render_qq_message_to_plain_markdown(messages)
-    return f"[回复 {sender_name}: {reply_text.strip()}]\n"
+    result = escape_mdv2(f"[回复 {sender_name}: ")
+    result += reply_text.strip()
+    result += escape_mdv2("]\n")
+    return result
 
 def render_qq_forward_message_to_texts(
     messages: list[dict[str, Any]]
@@ -691,7 +701,7 @@ def render_qq_forward_message_to_texts(
         if len(sender_name) == 0:
             sender_name = sender.get("nickname", "[???]")
         message_content = msg.get("message", [])
-        result_text += f"{sender_name}: "
+        result_text += f"{escape_mdv2(sender_name)}: "
         result_text += render_qq_message_to_plain_markdown(message_content)
         result_text += "\n"
     return result_text
@@ -721,7 +731,7 @@ async def qq_message_handler(message: websockets.Data):
     
     if isinstance(messages, str):
         # 如果消息是字符串，直接使用
-        tg_msg.text_context = messages
+        tg_msg.text_context = escape_mdv2(messages)
     elif isinstance(messages, list):
         for msg in messages:
             match msg.get("type"):
@@ -738,12 +748,12 @@ async def qq_message_handler(message: websockets.Data):
                                 reply_info_text = render_qq_message_to_reply_text(qq_replied_to_msg)
                             except Exception as e:
                                 logging.error(f"Failed to get reply message info for QQ ID {reply_message_id}: {e}")
-                                reply_info_text = "[无法获取回复消息内容]"
+                                reply_info_text = escape_mdv2("[无法获取回复消息内容]")
 
                 case "at":
                     at_qq_id_or_all = msg.get("data", {}).get("qq", "")
                     if at_qq_id_or_all == "all":
-                        tg_msg.text_context += "@所有人 "
+                        tg_msg.text_context += escape_mdv2("@所有人 ")
                     else:
                         try:
                             qq_id = int(at_qq_id_or_all)
@@ -752,18 +762,18 @@ async def qq_message_handler(message: websockets.Data):
                             if user_mapping is not None:
                                 # 如果找到绑定的 TG 用户，转换为 TG 的 mention
                                 at_name = user_mapping.tg_username or qq_id
-                                tg_msg.text_context += f"[{at_name}](tg://user?id={user_mapping.tg_user_id}) "
+                                tg_msg.text_context += mention_markdown(user_mapping.tg_user_id, at_name, version=2) + " "
                             else:
                                 logging.info(f"QQ ID {qq_id} is not bound to any TG user.")
                                 # 如果没有绑定，显示 QQ 号
-                                tg_msg.text_context += f"@{at_qq_id_or_all} "
+                                tg_msg.text_context += escape_mdv2(f"@{at_qq_id_or_all} ")
                         except ValueError:
                             logging.error(f"Invalid QQ ID format: {at_qq_id_or_all}, treating as mention")
-                            tg_msg.text_context += f"@{at_qq_id_or_all} "
+                            tg_msg.text_context += escape_mdv2(f"@{at_qq_id_or_all} ")
                 case "text":
                     text = msg.get("data", {}).get("text", "")
                     if len(text) > 0:
-                        tg_msg.text_context += text
+                        tg_msg.text_context += escape_mdv2(text)
                 case "image":
                     if tg_msg.image_url is not None:
                         tg_sent_msgs.append(await tg_msg.send_to_telegram(default_tg_chat_id, app))
@@ -788,22 +798,23 @@ async def qq_message_handler(message: websockets.Data):
                             url = await parse_b23_url_if_any(url)
                         desc = info_data.get("desc", "")
                         tag = info_data.get("tag", "")
-                        tg_msg.text_context += "[卡片分享]\n"
+                        tg_msg.text_context += escape_mdv2("[卡片分享]\n")
                         if len(title) > 0:
-                            tg_msg.text_context += f"标题：{title}\n"
+                            tg_msg.text_context += escape_mdv2(f"标题：{title}\n")
                         if len(desc) > 0:
-                            tg_msg.text_context += f"描述：{desc}\n"
+                            tg_msg.text_context += escape_mdv2(f"描述：{desc}\n")
                         if len(tag) > 0:
-                            tg_msg.text_context += f"标签：{tag}\n"
+                            tg_msg.text_context += escape_mdv2(f"标签：{tag}\n")
                         if len(url) > 0:
-                            tg_msg.text_context += f"链接：{url}\n"
+                            tg_msg.text_context += escape_mdv2(f"链接：{url}\n")
                     except json.JSONDecodeError:
-                        tg_msg.text_context += f"[无法解析的 JSON 卡片]\n```json\n{json.dumps(json_obj, indent=2, ensure_ascii=False)}\n```"
+                        tg_msg.text_context += escape_mdv2("[无法解析的 JSON 卡片消息]\n")
+                        tg_msg.text_context += f"```json\n{json.dumps(json_obj, indent=2, ensure_ascii=False)}\n```"
                 case "forward":
                     # 转发消息，通常是来自其他 QQ 群的消息
                     forward_list_id: Optional[str] = msg.get("data", {}).get("id")
                     if forward_list_id is None:
-                        tg_msg.text_context += "[无法解析的转发消息 ID]"
+                        tg_msg.text_context += escape_mdv2("[无法解析的转发消息 ID]")
                     else:
                         try:
                             forward_msg_data = await qq_get_forward_msg_info(forward_list_id)
@@ -811,20 +822,20 @@ async def qq_message_handler(message: websockets.Data):
                             tg_msg.text_context += render_qq_forward_message_to_texts(forward_msg_data.get("data", {}).get("messages", [])[:5])
                         except Exception as e:
                             logging.error(f"Failed to get forward message info for ID {forward_list_id}: {e}")
-                            tg_msg.text_context += "[无法获取转发消息内容]"
+                            tg_msg.text_context += escape_mdv2("[无法获取转发消息内容]")
                             continue
                     
                 case "face":
                     face_id: str = msg.get("data", {}).get("id")
-                    tg_msg.text_context += f" [表情 {face_id}] "
+                    tg_msg.text_context += escape_mdv2(f" [表情 {face_id}] ")
                 case "record":
-                    tg_msg.text_context += " [语音] "
+                    tg_msg.text_context += escape_mdv2(" [语音] ")
                 case "video":
-                    tg_msg.text_context += " [视频] "
+                    tg_msg.text_context += escape_mdv2(" [视频] ")
                 case "file":
-                    tg_msg.text_context += " [文件] "
+                    tg_msg.text_context += escape_mdv2(" [文件] ")
                 case _:
-                    tg_msg.text_context += f"[未知类型消息: {msg.get('type', 'unknown')}] "
+                    tg_msg.text_context += escape_mdv2(f"[未知类型消息: {msg.get('type', 'unknown')}] ")
                 
     
     # 将回复信息添加到消息开头
