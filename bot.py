@@ -175,7 +175,7 @@ class DB:
 
 db = DB(db_path)
 
-app = ApplicationBuilder().token(bot_token).build()
+app = ApplicationBuilder().token(bot_token).read_timeout(30.).write_timeout(30.).build()
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -603,7 +603,7 @@ class ConstructedTelegramMessageFromQQ:
             # 如果有图片，发送图片消息
             if await self._is_animated_image():
                 # 如果是动画图片，使用 send_animation
-                return await app.bot.send_animation(
+                return await retry_on_network_error(app.bot.send_animation,
                     chat_id=chat_id,
                     animation=self.image_url,
                     caption=text_with_sender,
@@ -612,7 +612,7 @@ class ConstructedTelegramMessageFromQQ:
                 )
             else:
                 # 如果是静态图片，使用 send_photo
-                return await app.bot.send_photo(
+                return await retry_on_network_error(app.bot.send_photo,
                     chat_id=chat_id,
                     photo=self.image_url,
                     caption=text_with_sender,
@@ -621,7 +621,7 @@ class ConstructedTelegramMessageFromQQ:
                 )
         else:
             # 如果没有图片，发送文本消息
-            return await app.bot.send_message(
+            return await retry_on_network_error(app.bot.send_message,
                 chat_id=chat_id,
                 text=text_with_sender,
                 reply_parameters=reply_parameters,
@@ -943,6 +943,17 @@ async def parse_b23_url_if_any(url: str) -> str:
             logging.warning(f"Failed to resolve Bilibili URL {url}, status code: {response.status_code}")
             return url
 
+async def retry_on_network_error(func, wait_sec=3, try_count=3, *args, **kwargs):
+    """
+    纯工具函数，用于在 tg 发送消息时遇到网络错误时进行重试
+    """
+    for attempt in range(try_count):
+        try:
+            return await func(*args, **kwargs)
+        except telegram.error.NetworkError as e:
+            logging.exception(f"Network error on attempt {attempt + 1}: {e}")
+            await asyncio.sleep(wait_sec)
+    
 app.add_handlers(
     [
         CommandHandler("start", start),
