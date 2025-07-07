@@ -831,7 +831,8 @@ async def qq_message_handler(message: websockets.Data):
                 case "record":
                     tg_msg.text_context += escape_mdv2(" [语音] ")
                 case "video":
-                    tg_msg.text_context += escape_mdv2(" [视频] ")
+                    video_url: str = msg.get("data", {}).get("url")
+                    tg_msg.text_context += f" [视频]({video_url}) "
                 case "file":
                     tg_msg.text_context += escape_mdv2(" [文件] ")
                 case _:
