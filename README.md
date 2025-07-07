@@ -5,7 +5,7 @@ Telegram-QQ-Bot 是一个机器人，用于将 Telegram 群组和 QQ 群互通�
 ## 1. 功能特点
 
 * Telegram 群组 <-> QQ 群消息双向转发
-* 支持 Telegram 的文本消息、图片/动画和组合消息
+* 支持 Telegram 的文本消息、图片/动画/语音和组合消息
 * 支持 QQ 的聊天记录合并转发预览
 * 支持双向 Reply
 * 支持双向 @ 提及绑定（使用 `/bindqq <QQ 号>` 命令来绑定 Telegram 用户和 QQ 号）

@@ -1,5 +1,6 @@
+from hashlib import sha3_256
 from pathlib import Path
-from typing import Any, Literal, Optional, ClassVar
+from typing import Any, Literal, Optional, ClassVar, overload
 import uuid
 from telegram import Message, Update, ReplyParameters
 import telegram
@@ -304,6 +305,19 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
                 }
             }
         )
+    if message.voice is not None:
+        # 处理语音消息（OGG）
+        voice_file = await message.voice.get_file()
+        voice_data = await get_converted_voice_with_cache(voice_file, voice_file.file_unique_id, voice_file.file_path)
+        single_qq_msg.append(
+            {
+                "type": "record",
+                "data": {
+                    "file": encode_bytearray_to_base64_uri(voice_data),
+                }
+            }
+        )
+
     if len(message.photo) > 0:
         # 处理图片消息
         photo = message.photo[-1]
@@ -432,6 +446,8 @@ CACHE_DIR = os.getenv("CACHE_DIR", "runtime")
 os.makedirs(CACHE_DIR, exist_ok=True)
 CONVERTED_IMAGE_CACHE_DIR = Path(CACHE_DIR) / "image_cache"
 os.makedirs(CONVERTED_IMAGE_CACHE_DIR, exist_ok=True)
+CONVERTED_VOICE_CACHE_DIR = Path(CACHE_DIR) / "voice_cache"
+os.makedirs(CONVERTED_VOICE_CACHE_DIR, exist_ok=True)
 
 from lottie.importers import importers
 from lottie.exporters import exporters
@@ -440,7 +456,11 @@ tgs_importer: Baseporter = importers.get_from_extension("tgs")
 gif_exporter: Baseporter = exporters.get_from_extension("gif")
 
 async def get_converted_image_with_cache(file_obj: telegram.File, file_path: str, file_unique_id: str) -> bytes:
-    """通过 unique_id 获取转码后的图片，如果缓存不存在则下载并转码"""
+    """
+    通过 unique_id 获取转码后的图片，如果缓存不存在则下载并转码
+
+    仅处理从 tg 到 qq 的转码
+    """
     # 直接用 unique_id 作为缓存文件名
     cache_path = os.path.join(CONVERTED_IMAGE_CACHE_DIR, file_unique_id)
     
@@ -497,6 +517,70 @@ async def get_converted_image_with_cache(file_obj: telegram.File, file_path: str
     logging.info(f"Cached converted file: {cache_path}")
     
     return converted_data
+
+@overload
+async def get_converted_voice_with_cache(file_url: str, file_unique_id: str) -> bytes:
+    ...
+@overload
+async def get_converted_voice_with_cache(file_url: telegram.File, file_unique_id: str, file_path: str) -> bytes:
+    ...
+async def get_converted_voice_with_cache(file_url: str | telegram.File, file_unique_id: str, file_path: Optional[str] = None) -> bytes:
+    """
+    通过 unique_id 获取转码后的语音，如果缓存不存在则下载并转码
+
+    注意，与图片不同，语音在双向都需要转码（tg .ogg -> qq .amr, qq .amr -> tg .ogg）
+    """
+    cache_path = os.path.join(CONVERTED_VOICE_CACHE_DIR, file_unique_id)
+    if os.path.exists(cache_path):
+        logging.info(f"Using cached voice file: {cache_path}")
+        with open(cache_path, "rb") as f:
+            return f.read()
+
+    # 缓存不存在，下载并转码
+    logging.info(f"Cache miss, downloading and converting voice: {file_unique_id}")
+    voice_data: bytes
+    mime_type_or_ext = file_path.lower() if file_path else None
+    if isinstance(file_url, telegram.File):
+        # 如果是 File 对象，直接下载
+        voice_data = bytes(await file_url.download_as_bytearray())
+    else:
+        # 如果是 URL，使用 httpx 下载
+        async with httpx.AsyncClient() as client:
+            response = await client.get(file_url, timeout=10)
+        if response.status_code != 200:
+            logging.error(f"Failed to download voice file from {file_url}, status code: {response.status_code}")
+            raise RuntimeError(f"Failed to download voice file from {file_url}")
+        voice_data = response.content
+        mime_type_or_ext = response.headers.get("Content-Type", "").lower()
+    
+    assert mime_type_or_ext is not None and isinstance(mime_type_or_ext, str), "mime_type_or_ext must be a string"
+
+    if mime_type_or_ext.endswith("ogg"):
+        # OGG 转 AMR
+        ffmpeg = (
+            FFmpeg(FFMPEG_EXECUTABLE)
+            .input("pipe:0")
+            .output("pipe:1", f="amr_nb")
+        )
+        converted_data = await ffmpeg.execute(bytes(voice_data))
+    elif mime_type_or_ext.endswith("amr"):
+        # AMR 转 OGG
+        ffmpeg = (
+            FFmpeg(FFMPEG_EXECUTABLE)
+            .input("pipe:0")
+            .output("pipe:1", f="ogg")
+        )
+        converted_data = await ffmpeg.execute(bytes(voice_data))
+    else:
+        # 其他格式不转码，直接使用原始数据
+        converted_data = voice_data
+    
+    # 保存到缓存
+    with open(cache_path, "wb") as f:
+        f.write(converted_data)
+    logging.info(f"Cached converted voice file: {cache_path}")
+    return converted_data
+
 
 def encode_bytearray_to_base64_uri(data: bytes) -> str:
     """将字节数组编码为 Base64 字符串"""
@@ -565,15 +649,17 @@ class ConstructedTelegramMessageFromQQ:
     # 消息内容
     text_context: str = ""
     image_url: Optional[str] = None
-
+    voice_data: Optional[bytes] = None
+    
     def is_empty(self) -> bool:
         """检查当前消息内容是否为空"""
-        return len(self.text_context.strip()) == 0 and self.image_url is None
-    
+        return len(self.text_context.strip()) == 0 and self.image_url is None and self.voice_data is None
+
     def reset(self):
         """重置消息内容为空，但不重置回复 ID、发送者名称等元数据"""
         self.text_context = ""
         self.image_url = None
+        self.voice_data = None
 
     async def _is_animated_image(self) -> bool:
         """检查当前消息是否包含动画图片"""
@@ -584,6 +670,11 @@ class ConstructedTelegramMessageFromQQ:
             async with client.stream("GET", self.image_url, timeout=5) as response:
                 content_type = response.headers.get("Content-Type", "").lower()
                 return "image/gif" in content_type
+
+    @property
+    def has_media(self) -> bool:
+        """检查当前消息是否包含媒体内容（图片或语音），因此不能再插入新的媒体"""
+        return self.image_url is not None or self.voice_data is not None
 
     async def send_to_telegram(self, chat_id: int, app: Application) -> Optional[Message]:
         """将构造的消息发送到 Telegram"""
@@ -619,8 +710,17 @@ class ConstructedTelegramMessageFromQQ:
                     reply_parameters=reply_parameters,
                     parse_mode=telegram.constants.ParseMode.MARKDOWN_V2,
                 )
+        elif self.voice_data is not None:
+            # 如果有语音，发送语音消息
+            return await retry_on_network_error(app.bot.send_voice,
+                chat_id=chat_id,
+                voice=self.voice_data,
+                caption=text_with_sender,
+                reply_parameters=reply_parameters,
+                parse_mode=telegram.constants.ParseMode.MARKDOWN_V2,
+            )
         else:
-            # 如果没有图片，发送文本消息
+            # 如果没有媒体，发送文本消息
             return await retry_on_network_error(app.bot.send_message,
                 chat_id=chat_id,
                 text=text_with_sender,
@@ -775,7 +875,8 @@ async def qq_message_handler(message: websockets.Data):
                     if len(text) > 0:
                         tg_msg.text_context += escape_mdv2(text)
                 case "image":
-                    if tg_msg.image_url is not None:
+                    if tg_msg.has_media:
+                        # 如果已经有媒体内容，发送当前消息并重置
                         tg_sent_msgs.append(await tg_msg.send_to_telegram(default_tg_chat_id, app))
                         tg_msg.reset()
                     tg_msg.image_url = msg.get("data", {}).get("url")
@@ -829,7 +930,12 @@ async def qq_message_handler(message: websockets.Data):
                     face_id: str = msg.get("data", {}).get("id")
                     tg_msg.text_context += escape_mdv2(f" [表情 {face_id}] ")
                 case "record":
-                    tg_msg.text_context += escape_mdv2(" [语音] ")
+                    if tg_msg.has_media:
+                        # 如果已经有媒体内容，发送当前消息并重置
+                        tg_sent_msgs.append(await tg_msg.send_to_telegram(default_tg_chat_id, app))
+                        tg_msg.reset()
+                    voice_url = msg.get("data", {}).get("url")
+                    tg_msg.voice_data = await get_converted_voice_with_cache(voice_url, sha3_256(voice_url.encode()).hexdigest())
                 case "video":
                     video_url: str = msg.get("data", {}).get("url")
                     tg_msg.text_context += f" [视频]({video_url}) "
