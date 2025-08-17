@@ -77,11 +77,13 @@ class DB:
     def __init__(self, db_path: str):
         self.connection = sqlite3.connect(db_path)
         self.connection.row_factory = sqlite3.Row
+        # Condition 用于在查询不到映射时等待 map_message 的 notify
+        self._condition = asyncio.Condition()
         with self.connection:
             self.connection.execute(self.SavedMessageMapping.CREATE_TBL)
             self.connection.execute(self.SavedUserMapping.CREATE_TBL)
 
-    def map_message(self, mapping: SavedMessageMapping):
+    async def map_message(self, mapping: SavedMessageMapping):
         """将 QQ 消息和 TG 消息进行映射"""
         with self.connection:
             self.connection.execute(
@@ -91,31 +93,44 @@ class DB:
                     mapping.tg_message_id,
                 ),
             )
+        # 通知所有等待 get_by_id 的协程
+        async with self._condition:
+            self._condition.notify_all()
 
-    def get_by_id(self, id: int, type_: Literal["qq", "tg"]) -> Optional[SavedMessageMapping]:
-        """根据 ID 获取映射的消息"""
-        cursor = self.connection.cursor()
-        if type_ == "qq":
-            cursor.execute(
-                "SELECT * FROM saved_qq_messages WHERE qq_message_id = ?",
-                (id,),
-            )
-        elif type_ == "tg":
-            cursor.execute(
-                "SELECT * FROM saved_qq_messages WHERE tg_message_id = ?",
-                (id,),
-            )
-        else:
-            raise ValueError("type_ must be either 'qq' or 'tg'")
+    async def get_by_id(self, id: int, type_: Literal["qq", "tg"], wait_timeout: float = 10.0) -> Optional[SavedMessageMapping]:
+        """根据 ID 获取映射的消息；如果未找到则等待 map_message 通知"""
+        wait_start_time = asyncio.get_event_loop().time()
+        async with self._condition:
+            while True:
+                cursor = self.connection.cursor()
+                if type_ == "qq":
+                    cursor.execute(
+                        "SELECT * FROM saved_qq_messages WHERE qq_message_id = ?",
+                        (id,),
+                    )
+                elif type_ == "tg":
+                    cursor.execute(
+                        "SELECT * FROM saved_qq_messages WHERE tg_message_id = ?",
+                        (id,),
+                    )
+                else:
+                    raise ValueError("type_ must be either 'qq' or 'tg'")
 
-        row = cursor.fetchone()
-        if row is None:
-            return None
-        return self.SavedMessageMapping(
-            qq_message_id=row["qq_message_id"],
-            tg_message_id=row["tg_message_id"],
-        )
-        
+                row = cursor.fetchone()
+                if row is not None:
+                    return self.SavedMessageMapping(
+                        qq_message_id=row["qq_message_id"],
+                        tg_message_id=row["tg_message_id"],
+                    )
+                # 未找到，且已经超时
+                if asyncio.get_event_loop().time() - wait_start_time > wait_timeout:
+                    return None
+                # 未找到，等待被 map_message 通知
+                try:
+                    await asyncio.wait_for(self._condition.wait(), timeout=wait_timeout)
+                except asyncio.TimeoutError:
+                    return None
+
     def bind_user(self, mapping: SavedUserMapping):
         """绑定 QQ 用户和 TG 用户"""
         with self.connection:
@@ -238,7 +253,7 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
     reply_info_text = ""
     try:
         if message.reply_to_message is not None:
-            saved_reply_to = db.get_by_id(message.reply_to_message.message_id, "tg")
+            saved_reply_to = await db.get_by_id(message.reply_to_message.message_id, "tg")
             if saved_reply_to is None:
                 # 找不到映射消息时，获取原始回复消息内容
                 reply_msg = message.reply_to_message
@@ -461,7 +476,7 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
             traceback.print_exc()
     # 保存映射关系
     if qq_message_id is not None:
-        db.map_message(
+        await db.map_message(
             DB.SavedMessageMapping(
                 qq_message_id=qq_message_id,
                 tg_message_id=message.message_id,
@@ -869,7 +884,7 @@ async def qq_message_handler(message: websockets.Data):
                     case "reply":
                         reply_message_id = msg.get("data", {}).get("id")
                         if reply_message_id is not None:
-                            saved_reply = db.get_by_id(reply_message_id, "qq")
+                            saved_reply = await db.get_by_id(reply_message_id, "qq")
                             if saved_reply is not None:
                                 tg_msg.reply_tg_message_id = saved_reply.tg_message_id
                             else:
@@ -1028,7 +1043,7 @@ async def qq_message_handler(message: websockets.Data):
         logging.warning(f"Failed to send message to Telegram, skipping mapping for QQ message ID {qq_message_id}")
         return
 
-    db.map_message(
+    await db.map_message(
         DB.SavedMessageMapping(
             qq_message_id=int(qq_message_id),
             tg_message_id=tg_message_id,
