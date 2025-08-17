@@ -22,6 +22,7 @@ from dataclasses import dataclass
 import websockets
 import json
 import httpx
+import traceback
 
 load_dotenv()
 
@@ -229,214 +230,243 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
             f"Received message from group {message.chat.id}, but not in {group_ids}"
         )
         return
-    
+
     logging.info(f"Received update: {message}")
-    
+
+    qq_message_id = None
     saved_reply_to = None
     reply_info_text = ""
-    if message.reply_to_message is not None:
-        saved_reply_to = db.get_by_id(message.reply_to_message.message_id, "tg")
-        if saved_reply_to is None:
-            # 找不到映射消息时，获取原始回复消息内容
-            reply_msg = message.reply_to_message
-            reply_user = reply_msg.from_user.first_name if reply_msg.from_user else "[???]"
-            if reply_msg.from_user and reply_msg.from_user.last_name:
-                reply_user += f" {reply_msg.from_user.last_name}"
-            
-            reply_content = ""
-            if reply_msg.text:
-                reply_content = reply_msg.text[:50] + ("..." if len(reply_msg.text) > 50 else "")
-            elif reply_msg.caption:
-                reply_content = reply_msg.caption[:50] + ("..." if len(reply_msg.caption) > 50 else "")
-            elif reply_msg.sticker:
-                reply_content = "[表情]"
-            elif reply_msg.animation:
-                reply_content = "[动画]"
-            elif reply_msg.photo:
-                reply_content = "[图片]"
-            else:
-                reply_content = "[不可解析消息]"
-            
-            reply_info_text = f"[回复 {reply_user}: {reply_content}]\n"
-    
-    single_qq_msg = []
-    if saved_reply_to is not None:
-        # 如果是回复消息，添加引用信息
-        single_qq_msg.append(
-            {
-                "type": "reply",
-                "data": {
-                    "id": saved_reply_to.qq_message_id,
-                },
-            }
-        )
-    
-    single_qq_msg.append(
-        {
-            "type": "text",
-            "data": {
-                "text": f"{reply_info_text}{message.from_user.first_name}{' ' + message.from_user.last_name if message.from_user.last_name is not None else ''}: ",
-            }
-        }
-    )
-    if message.sticker is not None:
-        # 处理贴纸消息
-        sticker_file = await message.sticker.get_file()
-        img_data = await get_converted_image_with_cache(sticker_file, sticker_file.file_path, message.sticker.file_unique_id)
-        single_qq_msg.append(
-            {
-                "type": "image",
-                "data": {
-                    "file": encode_bytearray_to_base64_uri(img_data),
-                    "sub_type": 1,
-                }
-            }
-        )
-    if message.animation is not None:
-        # 处理动画消息（GIF/WebM）
-        animation_file = await message.animation.get_file()
-        img_data = await get_converted_image_with_cache(animation_file, animation_file.file_path, message.animation.file_unique_id)
-        single_qq_msg.append(
-            {
-                "type": "image",
-                "data": {
-                    "file": encode_bytearray_to_base64_uri(img_data),
-                    "sub_type": 1,
-                }
-            }
-        )
-    if message.voice is not None:
-        # 处理语音消息（OGG）
-        voice_file = await message.voice.get_file()
-        voice_data = await get_converted_voice_with_cache(voice_file, voice_file.file_unique_id, voice_file.file_path)
-        single_qq_msg.append(
-            {
-                "type": "record",
-                "data": {
-                    "file": encode_bytearray_to_base64_uri(voice_data),
-                }
-            }
-        )
+    try:
+        if message.reply_to_message is not None:
+            saved_reply_to = db.get_by_id(message.reply_to_message.message_id, "tg")
+            if saved_reply_to is None:
+                # 找不到映射消息时，获取原始回复消息内容
+                reply_msg = message.reply_to_message
+                reply_user = reply_msg.from_user.first_name if reply_msg.from_user else "[???]"
+                if reply_msg.from_user and reply_msg.from_user.last_name:
+                    reply_user += f" {reply_msg.from_user.last_name}"
 
-    if len(message.photo) > 0:
-        # 处理图片消息
-        photo = message.photo[-1]
-        image_file = await photo.get_file()
-        img_data = await get_converted_image_with_cache(image_file, image_file.file_path, photo.file_unique_id)
+                reply_content = ""
+                if reply_msg.text:
+                    reply_content = reply_msg.text[:50] + ("..." if len(reply_msg.text) > 50 else "")
+                elif reply_msg.caption:
+                    reply_content = reply_msg.caption[:50] + ("..." if len(reply_msg.caption) > 50 else "")
+                elif reply_msg.sticker:
+                    reply_content = "[表情]"
+                elif reply_msg.animation:
+                    reply_content = "[动画]"
+                elif reply_msg.photo:
+                    reply_content = "[图片]"
+                else:
+                    reply_content = "[不可解析消息]"
+
+                reply_info_text = f"[回复 {reply_user}: {reply_content}]\n"
+
+        single_qq_msg = []
+        if saved_reply_to is not None:
+            # 如果是回复消息，添加引用信息
+            single_qq_msg.append(
+                {
+                    "type": "reply",
+                    "data": {
+                        "id": saved_reply_to.qq_message_id,
+                    },
+                }
+            )
+
         single_qq_msg.append(
             {
-                "type": "image",
+                "type": "text",
                 "data": {
-                    "file": encode_bytearray_to_base64_uri(img_data),
+                    "text": f"{reply_info_text}{message.from_user.first_name}{' ' + message.from_user.last_name if message.from_user.last_name is not None else ''}: ",
                 }
             }
         )
-    
-    # 处理文本消息和其中实体
-    if message.text is not None:
-        # 按实体位置切割文本
-        text_segments = []
-        last_offset = 0
-        
-        # 按照实体的偏移量排序
-        sorted_entities = sorted(message.entities or [], key=lambda e: e.offset)
-        
-        for entity in sorted_entities:
-            # 添加实体前的文本
-            if entity.offset > last_offset:
-                text_segments.append({
-                    "type": "text",
-                    "content": message.text[last_offset:entity.offset]
-                })
-            
-            # 处理实体
-            if entity.type == "mention":
-                # 处理 @username 格式
-                mentioned_username = message.text[entity.offset:entity.offset + entity.length]
-                username = mentioned_username[1:]  # 去掉 @ 符号
-                user_mapping = db.get_user_by_username(username)
-                if user_mapping:
-                    text_segments.append({
-                        "type": "at",
-                        "qq_id": str(user_mapping.qq_user_id)
-                    })
-                else:
+        if message.sticker is not None:
+            # 处理贴纸消息
+            sticker_file = await message.sticker.get_file()
+            img_data = await get_converted_image_with_cache(sticker_file, sticker_file.file_path, message.sticker.file_unique_id)
+            single_qq_msg.append(
+                {
+                    "type": "image",
+                    "data": {
+                        "file": encode_bytearray_to_base64_uri(img_data),
+                        "sub_type": 1,
+                    }
+                }
+            )
+        if message.animation is not None:
+            # 处理动画消息（GIF/WebM）
+            animation_file = await message.animation.get_file()
+            img_data = await get_converted_image_with_cache(animation_file, animation_file.file_path, message.animation.file_unique_id)
+            single_qq_msg.append(
+                {
+                    "type": "image",
+                    "data": {
+                        "file": encode_bytearray_to_base64_uri(img_data),
+                        "sub_type": 1,
+                    }
+                }
+            )
+        if message.voice is not None:
+            # 处理语音消息（OGG）
+            voice_file = await message.voice.get_file()
+            voice_data = await get_converted_voice_with_cache(voice_file, voice_file.file_unique_id, voice_file.file_path)
+            single_qq_msg.append(
+                {
+                    "type": "record",
+                    "data": {
+                        "file": encode_bytearray_to_base64_uri(voice_data),
+                    }
+                }
+            )
+
+        if len(message.photo) > 0:
+            # 处理图片消息
+            photo = message.photo[-1]
+            image_file = await photo.get_file()
+            img_data = await get_converted_image_with_cache(image_file, image_file.file_path, photo.file_unique_id)
+            single_qq_msg.append(
+                {
+                    "type": "image",
+                    "data": {
+                        "file": encode_bytearray_to_base64_uri(img_data),
+                    }
+                }
+            )
+
+        # 处理文本消息和其中实体
+        if message.text is not None:
+            # 按实体位置切割文本
+            text_segments = []
+            last_offset = 0
+
+            # 按照实体的偏移量排序
+            sorted_entities = sorted(message.entities or [], key=lambda e: e.offset)
+
+            for entity in sorted_entities:
+                # 添加实体前的文本
+                if entity.offset > last_offset:
                     text_segments.append({
                         "type": "text",
-                        "content": mentioned_username
+                        "content": message.text[last_offset:entity.offset]
                     })
-            elif entity.type == "text_mention":
-                # 处理直接 mention 用户的情况
-                mentioned_user = entity.user
-                user_mapping = db.get_user_by_id(mentioned_user.id, "tg")
-                if user_mapping:
-                    text_segments.append({
-                        "type": "at",
-                        "qq_id": str(user_mapping.qq_user_id)
-                    })
+
+                # 处理实体
+                if entity.type == "mention":
+                    # 处理 @username 格式
+                    mentioned_username = message.text[entity.offset:entity.offset + entity.length]
+                    username = mentioned_username[1:]  # 去掉 @ 符号
+                    user_mapping = db.get_user_by_username(username)
+                    if user_mapping:
+                        text_segments.append({
+                            "type": "at",
+                            "qq_id": str(user_mapping.qq_user_id)
+                        })
+                    else:
+                        text_segments.append({
+                            "type": "text",
+                            "content": mentioned_username
+                        })
+                elif entity.type == "text_mention":
+                    # 处理直接 mention 用户的情况
+                    mentioned_user = entity.user
+                    user_mapping = db.get_user_by_id(mentioned_user.id, "tg")
+                    if user_mapping:
+                        text_segments.append({
+                            "type": "at",
+                            "qq_id": str(user_mapping.qq_user_id)
+                        })
+                    else:
+                        display_name = mentioned_user.first_name
+                        if mentioned_user.last_name:
+                            display_name += f" {mentioned_user.last_name}"
+                        text_segments.append({
+                            "type": "text",
+                            "content": f"@{display_name}"
+                        })
                 else:
-                    display_name = mentioned_user.first_name
-                    if mentioned_user.last_name:
-                        display_name += f" {mentioned_user.last_name}"
+                    # 其他类型的实体，保持原文本
                     text_segments.append({
                         "type": "text",
-                        "content": f"@{display_name}"
+                        "content": message.text[entity.offset:entity.offset + entity.length]
                     })
-            else:
-                # 其他类型的实体，保持原文本
+
+                last_offset = entity.offset + entity.length
+
+            # 添加最后剩余的文本
+            if last_offset < len(message.text):
                 text_segments.append({
                     "type": "text",
-                    "content": message.text[entity.offset:entity.offset + entity.length]
-                })
-            
-            last_offset = entity.offset + entity.length
-        
-        # 添加最后剩余的文本
-        if last_offset < len(message.text):
-            text_segments.append({
-                "type": "text",
-                "content": message.text[last_offset:]
-            })
-        
-        # 如果没有实体，直接添加整个文本
-        if not text_segments:
-            text_segments.append({
-                "type": "text",
-                "content": message.text
-            })
-        
-        # 将处理后的文本段转换为 QQ 消息格式
-        for segment in text_segments:
-            if segment["type"] == "text" and segment["content"]:
-                single_qq_msg.append({
-                    "type": "text",
-                    "data": {"text": segment["content"]}
-                })
-            elif segment["type"] == "at":
-                single_qq_msg.append({
-                    "type": "at",
-                    "data": {"qq": segment["qq_id"]}
+                    "content": message.text[last_offset:]
                 })
 
-    if message.caption is not None:
-        # 处理图片或视频的标题
-        single_qq_msg.append(
-            {
-                "type": "text",
-                "data": {
-                    "text": message.caption,
+            # 如果没有实体，直接添加整个文本
+            if not text_segments:
+                text_segments.append({
+                    "type": "text",
+                    "content": message.text
+                })
+
+            # 将处理后的文本段转换为 QQ 消息格式
+            for segment in text_segments:
+                if segment["type"] == "text" and segment["content"]:
+                    single_qq_msg.append({
+                        "type": "text",
+                        "data": {"text": segment["content"]}
+                    })
+                elif segment["type"] == "at":
+                    single_qq_msg.append({
+                        "type": "at",
+                        "data": {"qq": segment["qq_id"]}
+                    })
+
+        if message.caption is not None:
+            # 处理图片或视频的标题
+            single_qq_msg.append(
+                {
+                    "type": "text",
+                    "data": {
+                        "text": message.caption,
+                    }
                 }
-            }
-        )
-    
-    qq_message_id = await qq_send_msg_in_group(single_qq_msg)
+            )
+
+        qq_message_id = await qq_send_msg_in_group(single_qq_msg)
+    except Exception as e:
+        # 捕获解析过程中的任何错误
+        err_id = str(uuid.uuid4())
+        logging.error("=" * 32)
+        error_msg = "Error occurred while processing Telegram message -> QQ\n"
+        error_msg += f"Error ID: {err_id}\n"
+        error_msg += f"Error message: {escape_mdv2(str(e))}\n"
+        error_msg += f"Error traceback: {escape_mdv2(traceback.format_exc())}\n"
+        error_msg += f"Original message data: {escape_mdv2(json.dumps(message_data, indent=2, ensure_ascii=False))}"
+        logging.error(error_msg)
+        logging.error("=" * 32)
+        # 尝试发送错误消息到 Telegram
+        try:
+            qq_message_id = await qq_send_msg_in_group(
+                [
+                    {
+                        "type": "text",
+                        "data": {
+                            "text": error_msg,
+                        },
+                    }
+                ]
+            )
+        except Exception as e:
+            logging.error(f"Still failed to send error log to Telegram: {e}")
+            traceback.print_exc()
     # 保存映射关系
-    db.map_message(
-        DB.SavedMessageMapping(
-            qq_message_id=qq_message_id,
-            tg_message_id=message.message_id,
+    if qq_message_id is not None:
+        db.map_message(
+            DB.SavedMessageMapping(
+                qq_message_id=qq_message_id,
+                tg_message_id=message.message_id,
+            )
         )
-    )
 
 from ffmpeg.asyncio import FFmpeg
 FFMPEG_EXECUTABLE = os.getenv("FFMPEG_EXECUTABLE", "ffmpeg-7.0.2-amd64-static/ffmpeg")
@@ -810,14 +840,14 @@ async def qq_message_handler(message: websockets.Data):
     """处理从 QQ 接收到的消息"""
     import json
     message_data = json.loads(message)
-    
+
     if message_data.get("post_type") != "message" or message_data.get("message_type") != "group":
         return
     group_id = message_data.get("group_id")
     if str(group_id) != QQ_GROUP_ID:
         logging.debug(f"Received message from group {group_id}, but not in {QQ_GROUP_ID}")
         return
-    
+
     default_tg_chat_id = group_ids[0]
     messages = message_data.get("message", [])
     sender = message_data.get("sender", {})
@@ -828,140 +858,172 @@ async def qq_message_handler(message: websockets.Data):
     tg_msg = ConstructedTelegramMessageFromQQ(sender_name=sender_name)
     tg_sent_msgs: list[Optional[Message]] = []
     reply_info_text = ""
-    
-    if isinstance(messages, str):
-        # 如果消息是字符串，直接使用
-        tg_msg.text_context = escape_mdv2(messages)
-    elif isinstance(messages, list):
-        for msg in messages:
-            match msg.get("type"):
-                case "reply":
-                    reply_message_id = msg.get("data", {}).get("id")
-                    if reply_message_id is not None:
-                        saved_reply = db.get_by_id(reply_message_id, "qq")
-                        if saved_reply is not None:
-                            tg_msg.reply_tg_message_id = saved_reply.tg_message_id
-                        else:
-                            # 找不到映射消息时，尝试获取原 QQ 消息内容
-                            try:
-                                qq_replied_to_msg = await qq_get_msg_info(reply_message_id)
-                                reply_info_text = render_qq_message_to_reply_text(qq_replied_to_msg)
-                            except Exception as e:
-                                logging.error(f"Failed to get reply message info for QQ ID {reply_message_id}: {e}")
-                                reply_info_text = escape_mdv2("[无法获取回复消息内容]")
 
-                case "at":
-                    at_qq_id_or_all = msg.get("data", {}).get("qq", "")
-                    if at_qq_id_or_all == "all":
-                        tg_msg.text_context += escape_mdv2("@所有人 ")
-                    else:
-                        try:
-                            qq_id = int(at_qq_id_or_all)
-                            logging.info(f"Processing QQ ID: {qq_id}")
-                            user_mapping = db.get_user_by_id(qq_id, "qq")
-                            if user_mapping is not None:
-                                # 如果找到绑定的 TG 用户，转换为 TG 的 mention
-                                at_name = user_mapping.tg_username or qq_id
-                                tg_msg.text_context += mention_markdown(user_mapping.tg_user_id, at_name, version=2) + " "
+    try:
+        if isinstance(messages, str):
+            # 如果消息是字符串，直接使用
+            tg_msg.text_context = escape_mdv2(messages)
+        elif isinstance(messages, list):
+            for msg in messages:
+                match msg.get("type"):
+                    case "reply":
+                        reply_message_id = msg.get("data", {}).get("id")
+                        if reply_message_id is not None:
+                            saved_reply = db.get_by_id(reply_message_id, "qq")
+                            if saved_reply is not None:
+                                tg_msg.reply_tg_message_id = saved_reply.tg_message_id
                             else:
-                                logging.info(f"QQ ID {qq_id} is not bound to any TG user.")
-                                # 如果没有绑定，显示 QQ 号
+                                # 找不到映射消息时，尝试获取原 QQ 消息内容
+                                try:
+                                    qq_replied_to_msg = await qq_get_msg_info(
+                                        reply_message_id
+                                    )
+                                    reply_info_text = render_qq_message_to_reply_text(
+                                        qq_replied_to_msg
+                                    )
+                                except Exception as e:
+                                    logging.error(
+                                        f"Failed to get reply message info for QQ ID {reply_message_id}: {e}"
+                                    )
+                                    reply_info_text = escape_mdv2(
+                                        "[无法获取回复消息内容]"
+                                    )
+
+                    case "at":
+                        at_qq_id_or_all = msg.get("data", {}).get("qq", "")
+                        if at_qq_id_or_all == "all":
+                            tg_msg.text_context += escape_mdv2("@所有人 ")
+                        else:
+                            try:
+                                qq_id = int(at_qq_id_or_all)
+                                logging.info(f"Processing QQ ID: {qq_id}")
+                                user_mapping = db.get_user_by_id(qq_id, "qq")
+                                if user_mapping is not None:
+                                    # 如果找到绑定的 TG 用户，转换为 TG 的 mention
+                                    at_name = user_mapping.tg_username or qq_id
+                                    tg_msg.text_context += mention_markdown(user_mapping.tg_user_id, at_name, version=2) + " "
+                                else:
+                                    logging.info(f"QQ ID {qq_id} is not bound to any TG user.")
+                                    # 如果没有绑定，显示 QQ 号
+                                    tg_msg.text_context += escape_mdv2(f"@{at_qq_id_or_all} ")
+                            except ValueError:
+                                logging.error(f"Invalid QQ ID format: {at_qq_id_or_all}, treating as mention")
                                 tg_msg.text_context += escape_mdv2(f"@{at_qq_id_or_all} ")
-                        except ValueError:
-                            logging.error(f"Invalid QQ ID format: {at_qq_id_or_all}, treating as mention")
-                            tg_msg.text_context += escape_mdv2(f"@{at_qq_id_or_all} ")
-                case "text":
-                    text = msg.get("data", {}).get("text", "")
-                    if len(text) > 0:
-                        tg_msg.text_context += escape_mdv2(text)
-                case "image":
-                    if tg_msg.has_media:
-                        # 如果已经有媒体内容，发送当前消息并重置
-                        tg_sent_msgs.append(await tg_msg.send_to_telegram(default_tg_chat_id, app))
-                        tg_msg.reset()
-                    tg_msg.image_url = msg.get("data", {}).get("url")
-                case "json":
-                    json_str = msg.get('data', {}).get("data", "")
-                    try:
-                        # 解析以进行格式化
-                        json_obj = json.loads(json_str)
-                        # 处理 JSON 卡片消息，尝试解析其中的信息
-                        meta = json_obj["meta"]
-                        info_data = meta.get(list(meta.keys())[0], {})
-                        title = info_data.get("title", "")
-                        URL_KEYS = ["jumpUrl", "qqdocurl", "url"]
-                        url = ""
-                        for key in URL_KEYS:
-                            if key in info_data:
-                                url = info_data[key]
-                                break
-                        if len(url) > 0:
-                            url = await parse_b23_url_if_any(url)
-                        desc = info_data.get("desc", "")
-                        tag = info_data.get("tag", "")
-                        tg_msg.text_context += escape_mdv2("[卡片分享]\n")
-                        if len(title) > 0:
-                            tg_msg.text_context += escape_mdv2(f"标题：{title}\n")
-                        if len(desc) > 0:
-                            tg_msg.text_context += escape_mdv2(f"描述：{desc}\n")
-                        if len(tag) > 0:
-                            tg_msg.text_context += escape_mdv2(f"标签：{tag}\n")
-                        if len(url) > 0:
-                            tg_msg.text_context += escape_mdv2(f"链接：{url}\n")
-                    except json.JSONDecodeError:
-                        tg_msg.text_context += escape_mdv2("[无法解析的 JSON 卡片消息]\n")
-                        tg_msg.text_context += f"```json\n{json.dumps(json_obj, indent=2, ensure_ascii=False)}\n```"
-                case "forward":
-                    # 转发消息，通常是来自其他 QQ 群的消息
-                    forward_list_id: Optional[str] = msg.get("data", {}).get("id")
-                    if forward_list_id is None:
-                        tg_msg.text_context += escape_mdv2("[无法解析的转发消息 ID]")
-                    else:
+                    case "text":
+                        text = msg.get("data", {}).get("text", "")
+                        if len(text) > 0:
+                            tg_msg.text_context += escape_mdv2(text)
+                    case "image":
+                        if tg_msg.has_media:
+                            # 如果已经有媒体内容，发送当前消息并重置
+                            tg_sent_msgs.append(await tg_msg.send_to_telegram(default_tg_chat_id, app))
+                            tg_msg.reset()
+                        tg_msg.image_url = msg.get("data", {}).get("url")
+                    case "json":
+                        json_str = msg.get('data', {}).get("data", "")
                         try:
-                            forward_msg_data = await qq_get_forward_msg_info(forward_list_id)
-                            # 只渲染前 5 条消息
-                            tg_msg.text_context += render_qq_forward_message_to_texts(forward_msg_data.get("data", {}).get("messages", [])[:5])
-                        except Exception as e:
-                            logging.error(f"Failed to get forward message info for ID {forward_list_id}: {e}")
-                            tg_msg.text_context += escape_mdv2("[无法获取转发消息内容]")
-                            continue
-                    
-                case "face":
-                    face_id: str = msg.get("data", {}).get("id")
-                    tg_msg.text_context += escape_mdv2(f" [表情 {face_id}] ")
-                case "record":
-                    if tg_msg.has_media:
-                        # 如果已经有媒体内容，发送当前消息并重置
-                        tg_sent_msgs.append(await tg_msg.send_to_telegram(default_tg_chat_id, app))
-                        tg_msg.reset()
-                    voice_url = msg.get("data", {}).get("url")
-                    tg_msg.voice_data = await get_converted_voice_with_cache(voice_url, sha3_256(voice_url.encode()).hexdigest())
-                case "video":
-                    video_url: str = msg.get("data", {}).get("url")
-                    tg_msg.text_context += f" [视频]({video_url}) "
-                case "file":
-                    tg_msg.text_context += escape_mdv2(" [文件] ")
-                case _:
-                    tg_msg.text_context += escape_mdv2(f"[未知类型消息: {msg.get('type', 'unknown')}] ")
-                
-    
-    # 将回复信息添加到消息开头
-    if reply_info_text:
-        tg_msg.text_context = reply_info_text + tg_msg.text_context
-        
-    tg_sent_msgs.append(await tg_msg.send_to_telegram(default_tg_chat_id, app))
+                            # 解析以进行格式化
+                            json_obj = json.loads(json_str)
+                            # 处理 JSON 卡片消息，尝试解析其中的信息
+                            meta = json_obj["meta"]
+                            info_data = meta.get(list(meta.keys())[0], {})
+                            title = info_data.get("title", "")
+                            URL_KEYS = ["jumpUrl", "qqdocurl", "url"]
+                            url = ""
+                            for key in URL_KEYS:
+                                if key in info_data:
+                                    url = info_data[key]
+                                    break
+                            if len(url) > 0:
+                                url = await parse_b23_url_if_any(url)
+                            desc = info_data.get("desc", "")
+                            tag = info_data.get("tag", "")
+                            tg_msg.text_context += escape_mdv2("[卡片分享]\n")
+                            if len(title) > 0:
+                                tg_msg.text_context += escape_mdv2(f"标题：{title}\n")
+                            if len(desc) > 0:
+                                tg_msg.text_context += escape_mdv2(f"描述：{desc}\n")
+                            if len(tag) > 0:
+                                tg_msg.text_context += escape_mdv2(f"标签：{tag}\n")
+                            if len(url) > 0:
+                                tg_msg.text_context += escape_mdv2(f"链接：{url}\n")
+                        except json.JSONDecodeError:
+                            tg_msg.text_context += escape_mdv2("[无法解析的 JSON 卡片消息]\n")
+                            tg_msg.text_context += f"```json\n{json.dumps(json_obj, indent=2, ensure_ascii=False)}\n```"
+                    case "forward":
+                        # 转发消息，通常是来自其他 QQ 群的消息
+                        forward_list_id: Optional[str] = msg.get("data", {}).get("id")
+                        if forward_list_id is None:
+                            tg_msg.text_context += escape_mdv2("[无法解析的转发消息 ID]")
+                        else:
+                            try:
+                                forward_msg_data = await qq_get_forward_msg_info(forward_list_id)
+                                # 只渲染前 5 条消息
+                                tg_msg.text_context += render_qq_forward_message_to_texts(forward_msg_data.get("data", {}).get("messages", [])[:5])
+                            except Exception as e:
+                                logging.error(f"Failed to get forward message info for ID {forward_list_id}: {e}")
+                                tg_msg.text_context += escape_mdv2("[无法获取转发消息内容]")
+                                continue
+
+                    case "face":
+                        face_id: str = msg.get("data", {}).get("id")
+                        tg_msg.text_context += escape_mdv2(f" [表情 {face_id}] ")
+                    case "record":
+                        if tg_msg.has_media:
+                            # 如果已经有媒体内容，发送当前消息并重置
+                            tg_sent_msgs.append(await tg_msg.send_to_telegram(default_tg_chat_id, app))
+                            tg_msg.reset()
+                        voice_url = msg.get("data", {}).get("url")
+                        tg_msg.voice_data = await get_converted_voice_with_cache(voice_url, sha3_256(voice_url.encode()).hexdigest())
+                    case "video":
+                        video_url: str = msg.get("data", {}).get("url")
+                        tg_msg.text_context += f" [视频]({video_url}) "
+                    case "file":
+                        tg_msg.text_context += escape_mdv2(" [文件] ")
+                    case _:
+                        tg_msg.text_context += escape_mdv2(f"[未知类型消息: {msg.get('type', 'unknown')}] ")
+
+        # 将回复信息添加到消息开头
+        if reply_info_text:
+            tg_msg.text_context = reply_info_text + tg_msg.text_context
+
+        tg_sent_msgs.append(await tg_msg.send_to_telegram(default_tg_chat_id, app))
+    except Exception as e:
+        # 捕获解析过程中的任何错误
+        err_id = str(uuid.uuid4())
+        logging.error("=" * 32)
+        error_msg = "Error occurred while processing QQ message -> Telegram\n"
+        error_msg += f"Error ID: {err_id}\n"
+        error_msg += f"Error message: {escape_mdv2(str(e))}\n"
+        error_msg += f"Error traceback: {escape_mdv2(traceback.format_exc())}\n"
+        error_msg += f"Original message data: {escape_mdv2(json.dumps(message_data, indent=2, ensure_ascii=False))}"
+        logging.error(error_msg)
+        logging.error("=" * 32)
+        # 尝试发送错误消息到 Telegram
+        try:
+            tg_sent_msgs.append(
+                await app.bot.send_message(
+                    chat_id=chat_id,
+                    text=error_msg,
+                    parse_mode=telegram.constants.ParseMode.MARKDOWN_V2,
+                )
+            )
+        except Exception as e:
+            logging.error(f"Still failed to send error log to Telegram: {e}")
+            traceback.print_exc()
+
     # 保存映射关系
     qq_message_id = message_data.get("message_id")
     if qq_message_id is None:
         logging.warning(f"Received message without a valid QQ message ID, skipping mapping: {message_data}")
         return
-    
+
     tg_message_id = None
     for tg_msg in reversed(tg_sent_msgs):
         if tg_msg is not None:
             tg_message_id = tg_msg.message_id
             break
-    
+
     if tg_message_id is None:
         logging.warning(f"Failed to send message to Telegram, skipping mapping for QQ message ID {qq_message_id}")
         return
@@ -1059,7 +1121,7 @@ async def retry_on_network_error(func, wait_sec=3, try_count=3, *args, **kwargs)
         except telegram.error.NetworkError as e:
             logging.exception(f"Network error on attempt {attempt + 1}: {e}")
             await asyncio.sleep(wait_sec)
-    
+
 app.add_handlers(
     [
         CommandHandler("start", start),
