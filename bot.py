@@ -1,6 +1,6 @@
 from hashlib import sha3_256
 from pathlib import Path
-from typing import Any, Literal, Optional, ClassVar, overload
+from typing import Any, Generic, Literal, Optional, ClassVar, TypeVar, overload, cast
 import uuid
 from telegram import Message, Update, ReplyParameters
 import telegram
@@ -30,21 +30,25 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 
+T = TypeVar("T")
+def assert_not_none(value: Optional[T], message: str) -> T:
+    if value is None:
+        raise ValueError(message)
+    return value
+
 # Bot 配置
 group_ids = [
     int(group_id.strip())
     for group_id in os.getenv("GROUP_IDS", "-100_00000_00000").split(",")
 ]
 assert len(group_ids) > 0, "At least one group ID is required"
-bot_token = os.getenv("BOT_TOKEN")
-assert bot_token is not None, "BOT_TOKEN environment variable is required"
+bot_token = assert_not_none(os.getenv("BOT_TOKEN"), "BOT_TOKEN environment variable is required")
 DEVELOPER_ID = os.getenv("DEVELOPER_ID")
 
 # Napcat 配置
-NAPCAT_URL = os.getenv("NAPCAT_WS_URL")
-QQ_GROUP_ID = os.getenv("QQ_GROUP_ID")
+NAPCAT_URL = assert_not_none(os.getenv("NAPCAT_WS_URL"), "NAPCAT_WS_URL environment variable is required")
+QQ_GROUP_ID = assert_not_none(os.getenv("QQ_GROUP_ID"), "QQ_GROUP_ID environment variable is required")
 logging.info(f"\n\nQQ_GROUP_ID: {QQ_GROUP_ID}\n\n")
-assert QQ_GROUP_ID is not None, "QQ_GROUP_ID environment variable is required"
 
 # 载入消息数据库
 db_path = os.getenv("DB_PATH", "messages.db")
@@ -222,9 +226,13 @@ async def bind_qq_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     # 获取用户信息
-    tg_user_id = message.from_user.id
-    tg_username = message.from_user.username
-    
+    from_user = message.from_user
+    if from_user is None:
+        await message.reply_text("无法获取您的用户信息。")
+        return
+    tg_user_id = from_user.id
+    tg_username = from_user.username
+
     # 保存绑定关系
     db.bind_user(DB.SavedUserMapping(qq_user_id=qq_id, tg_user_id=tg_user_id, tg_username=tg_username))
     
@@ -290,35 +298,49 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
                 }
             )
 
-        single_qq_msg.append(
-            {
-                "type": "text",
-                "data": {
-                    "text": f"{reply_info_text}{message.from_user.first_name}{' ' + message.from_user.last_name if message.from_user.last_name is not None else ''}: ",
-                }
-            }
-        )
-        if message.sticker is not None:
-            # 处理贴纸消息
-            sticker_file = await message.sticker.get_file()
-            img_data = await get_converted_image_with_cache(sticker_file, sticker_file.file_path, message.sticker.file_unique_id)
+        # 添加发送者信息
+        if message.from_user is not None:
             single_qq_msg.append(
                 {
-                    "type": "image",
+                    "type": "text",
                     "data": {
-                        "file": encode_bytearray_to_base64_uri(img_data),
-                        "sub_type": 1,
+                        "text": f"{reply_info_text}{message.from_user.first_name}{' ' + message.from_user.last_name if message.from_user.last_name is not None else ''}: ",
                     }
                 }
             )
+        else:
+            single_qq_msg.append(
+                {
+                    "type": "text",
+                    "data": {
+                        "text": f"{reply_info_text}[未知用户]: ",
+                    }
+                }
+            )
+
+        if message.sticker is not None:
+            # 处理贴纸消息
+            sticker_file = await message.sticker.get_file()
+            if sticker_file.file_path is not None:
+                img_data = await get_converted_image_with_cache(sticker_file, sticker_file.file_path, message.sticker.file_unique_id)
+                single_qq_msg.append(
+                    {
+                        "type": "image",
+                        "data": {
+                            "file": encode_bytearray_to_base64_uri(img_data),
+                            "sub_type": 1,
+                        }
+                    }
+                )
         if message.animation is not None:
             # 处理动画消息（GIF/WebM）
             animation_file = await message.animation.get_file()
-            img_data = await get_converted_image_with_cache(animation_file, animation_file.file_path, message.animation.file_unique_id)
-            single_qq_msg.append(
-                {
-                    "type": "image",
-                    "data": {
+            if animation_file.file_path is not None:
+                img_data = await get_converted_image_with_cache(animation_file, animation_file.file_path, message.animation.file_unique_id)
+                single_qq_msg.append(
+                    {
+                        "type": "image",
+                        "data": {
                         "file": encode_bytearray_to_base64_uri(img_data),
                         "sub_type": 1,
                     }
@@ -327,29 +349,31 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         if message.voice is not None:
             # 处理语音消息（OGG）
             voice_file = await message.voice.get_file()
-            voice_data = await get_converted_voice_with_cache(voice_file, voice_file.file_unique_id, voice_file.file_path)
-            single_qq_msg.append(
-                {
-                    "type": "record",
-                    "data": {
-                        "file": encode_bytearray_to_base64_uri(voice_data),
+            if voice_file.file_path is not None:
+                voice_data = await get_converted_voice_with_cache(voice_file, voice_file.file_unique_id, voice_file.file_path)
+                single_qq_msg.append(
+                    {
+                        "type": "record",
+                        "data": {
+                            "file": encode_bytearray_to_base64_uri(voice_data),
+                        }
                     }
-                }
-            )
+                )
 
         if len(message.photo) > 0:
             # 处理图片消息
             photo = message.photo[-1]
             image_file = await photo.get_file()
-            img_data = await get_converted_image_with_cache(image_file, image_file.file_path, photo.file_unique_id)
-            single_qq_msg.append(
-                {
-                    "type": "image",
-                    "data": {
-                        "file": encode_bytearray_to_base64_uri(img_data),
+            if image_file.file_path is not None:
+                img_data = await get_converted_image_with_cache(image_file, image_file.file_path, photo.file_unique_id)
+                single_qq_msg.append(
+                    {
+                        "type": "image",
+                        "data": {
+                            "file": encode_bytearray_to_base64_uri(img_data),
+                        }
                     }
-                }
-            )
+                )
 
         # 处理文本消息和其中实体
         if message.text is not None:
@@ -387,19 +411,24 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
                 elif entity.type == "text_mention":
                     # 处理直接 mention 用户的情况
                     mentioned_user = entity.user
-                    user_mapping = db.get_user_by_id(mentioned_user.id, "tg")
+                    user_mapping = db.get_user_by_id(mentioned_user.id, "tg") if mentioned_user is not None else None
                     if user_mapping:
                         text_segments.append({
                             "type": "at",
                             "qq_id": str(user_mapping.qq_user_id)
                         })
-                    else:
+                    elif mentioned_user is not None:
                         display_name = mentioned_user.first_name
                         if mentioned_user.last_name:
                             display_name += f" {mentioned_user.last_name}"
                         text_segments.append({
                             "type": "text",
                             "content": f"@{display_name}"
+                        })
+                    else:
+                        text_segments.append({
+                            "type": "text",
+                            "content": "@[未知用户]"
                         })
                 else:
                     # 其他类型的实体，保持原文本
@@ -457,7 +486,7 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         error_msg += f"Error ID: {err_id}\n"
         error_msg += f"Error message: {escape_mdv2(str(e))}\n"
         error_msg += f"Error traceback: {escape_mdv2(traceback.format_exc())}\n"
-        error_msg += f"Original message data: {escape_mdv2(json.dumps(message_data, indent=2, ensure_ascii=False))}"
+        error_msg += f"Original message data: {escape_mdv2(json.dumps(message, indent=2, ensure_ascii=False))}"
         logging.error(error_msg)
         logging.error("=" * 32)
         # 尝试发送错误消息到 Telegram
@@ -498,8 +527,8 @@ os.makedirs(CONVERTED_VOICE_CACHE_DIR, exist_ok=True)
 from lottie.importers import importers
 from lottie.exporters import exporters
 from lottie.parsers.baseporter import Baseporter
-tgs_importer: Baseporter = importers.get_from_extension("tgs")
-gif_exporter: Baseporter = exporters.get_from_extension("gif")
+tgs_importer = cast(Baseporter, importers.get_from_extension("tgs"))
+gif_exporter = cast(Baseporter, exporters.get_from_extension("gif"))
 
 async def get_converted_image_with_cache(file_obj: telegram.File, file_path: str, file_unique_id: str) -> bytes:
     """
@@ -536,6 +565,8 @@ async def get_converted_image_with_cache(file_obj: telegram.File, file_path: str
         async with NamedTemporaryFile(suffix=".mp4") as temp_file:
             await temp_file.write(img_data)
             temp_file_path = temp_file.name
+            assert not isinstance(temp_file_path, int), "allocated temp file has no path but fd"
+            temp_file_path = str(temp_file_path)
             ffmpeg = (
                 FFmpeg(FFMPEG_EXECUTABLE)
                 .input(temp_file_path)
@@ -694,7 +725,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 
     # traceback.format_exception returns the usual python message about an exception, but as a
     # list of strings rather than a single string, so we have to join them together.
-    tb_list = traceback.format_exception(None, context.error, context.error.__traceback__)
+    tb_list = traceback.format_exception(None, context.error, context.error.__traceback__ if context.error else None)
     tb_string = "".join(tb_list)
 
     # Build the message with some markup and additional information about what happened.
@@ -830,7 +861,7 @@ def render_qq_message_to_plain_markdown(
                         user_mapping = db.get_user_by_id(qq_id, "qq")
                         if user_mapping is not None:
                             # 如果找到绑定的 TG 用户，转换为 TG 的 mention
-                            at_name = user_mapping.tg_username or qq_id
+                            at_name = user_mapping.tg_username or str(qq_id)
                             reply_text += mention_markdown(user_mapping.tg_user_id, at_name, version=2) + " "
                         else:
                             logging.info(f"QQ ID {qq_id} is not bound to any TG user.")
@@ -944,7 +975,7 @@ async def qq_message_handler(message: websockets.Data):
                                 user_mapping = db.get_user_by_id(qq_id, "qq")
                                 if user_mapping is not None:
                                     # 如果找到绑定的 TG 用户，转换为 TG 的 mention
-                                    at_name = user_mapping.tg_username or qq_id
+                                    at_name = user_mapping.tg_username or str(qq_id)
                                     tg_msg.text_context += mention_markdown(user_mapping.tg_user_id, at_name, version=2) + " "
                                 else:
                                     logging.info(f"QQ ID {qq_id} is not bound to any TG user.")
@@ -993,7 +1024,7 @@ async def qq_message_handler(message: websockets.Data):
                                 tg_msg.text_context += escape_mdv2(f"链接：{url}\n")
                         except json.JSONDecodeError:
                             tg_msg.text_context += escape_mdv2("[无法解析的 JSON 卡片消息]\n")
-                            tg_msg.text_context += f"```json\n{json.dumps(json_obj, indent=2, ensure_ascii=False)}\n```"
+                            tg_msg.text_context += f"```json\n{json_str}\n```"
                     case "forward":
                         # 转发消息，通常是来自其他 QQ 群的消息
                         forward_list_id: Optional[str] = msg.get("data", {}).get("id")
@@ -1044,6 +1075,9 @@ async def qq_message_handler(message: websockets.Data):
         logging.error(error_msg)
         logging.error("=" * 32)
         # 尝试发送错误消息到 Telegram
+        if DEVELOPER_ID is None:
+            logging.warning("DEVELOPER_ID is not set, skipping error report.")
+            return
         try:
             tg_sent_msgs.append(
                 await app.bot.send_message(
