@@ -1,6 +1,6 @@
 from hashlib import sha3_256
 from pathlib import Path
-from typing import Any, Generic, Literal, Optional, ClassVar, TypeVar, overload, cast
+from typing import Any, Literal, Optional, ClassVar, TypeVar, overload, cast
 import uuid
 from telegram import Message, Update, ReplyParameters
 import telegram
