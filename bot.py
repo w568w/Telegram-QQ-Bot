@@ -1047,7 +1047,7 @@ async def qq_message_handler(message: websockets.Data):
         try:
             tg_sent_msgs.append(
                 await app.bot.send_message(
-                    chat_id=chat_id,
+                    chat_id=DEVELOPER_ID,
                     text=error_msg,
                     parse_mode=telegram.constants.ParseMode.MARKDOWN_V2,
                 )
