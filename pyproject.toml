@@ -8,8 +8,10 @@ dependencies = [
     "aiofiles>=24.1.0",
     # required by lottie[gif]
     "cairosvg>=2.8.2",
+    # tg 表情转 gif
     "lottie[gif]>=0.7.2",
     "python-dotenv>=1.1.0",
+    # tg webm 动画和 sticker 转 gif
     "python-ffmpeg>=2.0.12",
     "python-telegram-bot>=22.0",
     "websockets>=15.0.1",
