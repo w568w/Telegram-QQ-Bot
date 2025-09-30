@@ -1067,8 +1067,8 @@ async def qq_message_handler(message: websockets.Data):
         # 捕获解析过程中的任何错误
         err_id = str(uuid.uuid4())
         logging.error("=" * 32)
-        error_msg = "Error occurred while processing QQ message -> Telegram\n"
-        error_msg += f"Error ID: {err_id}\n"
+        error_msg = escape_mdv2("Error occurred while processing QQ message -> Telegram\n")
+        error_msg += f"Error ID: {escape_mdv2(err_id)}\n"
         error_msg += f"Error message: {escape_mdv2(str(e))}\n"
         error_msg += f"Error traceback: {escape_mdv2(traceback.format_exc())}\n"
         error_msg += f"Original message data: {escape_mdv2(json.dumps(message_data, indent=2, ensure_ascii=False))}"
