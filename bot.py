@@ -197,7 +197,7 @@ class DB:
 
 db = DB(db_path)
 
-app = ApplicationBuilder().token(bot_token).read_timeout(30.).write_timeout(30.).build()
+app = ApplicationBuilder().token(bot_token).read_timeout(30.).write_timeout(30.).connection_pool_size(512).build()
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
