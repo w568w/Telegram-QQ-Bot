@@ -554,6 +554,8 @@ async def get_converted_image_with_cache(file_obj: telegram.File, file_path: str
         ffmpeg = (
             FFmpeg(FFMPEG_EXECUTABLE)
             .input("pipe:0")
+            .option("c:v", "libvpx-vp9")
+            .option("filter_complex", "split[a][b];[a]palettegen=reserve_transparent=on:stats_mode=single[p];[b][p]paletteuse=alpha_threshold=128")
             .output("pipe:1", f="gif")
         )
         converted_data = await ffmpeg.execute(bytes(img_data))
