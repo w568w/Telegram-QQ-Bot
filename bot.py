@@ -778,20 +778,28 @@ class ConstructedTelegramMessageFromQQ:
 
         if self.image_url is not None:
             # 如果有图片，发送图片消息
-            if await self._is_animated_image():
-                # 如果是动画图片，使用 send_animation
-                return await retry_on_network_error(app.bot.send_animation,
+            is_animated = await self._is_animated_image()
+            send_func = app.bot.send_animation if is_animated else app.bot.send_photo
+            media_key = "animation" if is_animated else "photo"
+            try:
+                # 先尝试云传输（传 URL 给 Telegram 服务器拉取）
+                return await send_func(
                     chat_id=chat_id,
-                    animation=self.image_url,
+                    **{media_key: self.image_url},
                     caption=text_with_sender,
                     reply_parameters=reply_parameters,
                     parse_mode=telegram.constants.ParseMode.MARKDOWN_V2,
                 )
-            else:
-                # 如果是静态图片，使用 send_photo
-                return await retry_on_network_error(app.bot.send_photo,
+            except telegram.error.BadRequest as e:
+                # Telegram 无法拉取该 URL，降级为本地下载后上传
+                logging.warning(f"Telegram failed to fetch image URL, downloading locally: {e}")
+                async with httpx.AsyncClient() as client:
+                    resp = await client.get(self.image_url, timeout=30)
+                    resp.raise_for_status()
+                    image_data = resp.content
+                return await retry_on_network_error(send_func,
                     chat_id=chat_id,
-                    photo=self.image_url,
+                    **{media_key: image_data},
                     caption=text_with_sender,
                     reply_parameters=reply_parameters,
                     parse_mode=telegram.constants.ParseMode.MARKDOWN_V2,
@@ -1058,11 +1066,15 @@ async def qq_message_handler(message: websockets.Data):
         if DEVELOPER_ID is None:
             logging.warning("DEVELOPER_ID is not set, skipping error report.")
             return
+        MAX_TG_MSG_LEN = 4000
+        tg_error_msg = error_msg
+        if len(tg_error_msg) > MAX_TG_MSG_LEN:
+            tg_error_msg = tg_error_msg[:MAX_TG_MSG_LEN] + escape_mdv2("\n... (truncated)")
         try:
             tg_sent_msgs.append(
                 await app.bot.send_message(
                     chat_id=DEVELOPER_ID,
-                    text=error_msg,
+                    text=tg_error_msg,
                     parse_mode=telegram.constants.ParseMode.MARKDOWN_V2,
                 )
             )
@@ -1210,6 +1222,8 @@ async def retry_on_network_error(func, wait_sec=3, try_count=3, *args, **kwargs)
     for attempt in range(try_count):
         try:
             return await func(*args, **kwargs)
+        except telegram.error.BadRequest:
+            raise
         except telegram.error.NetworkError as e:
             last_error = e
             logging.exception(f"Network error on attempt {attempt + 1}: {e}")
