@@ -744,9 +744,12 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 
     # Finally, send the message
     if DEVELOPER_ID is not None:
-        await context.bot.send_message(
-            chat_id=DEVELOPER_ID, text=message, parse_mode=telegram.constants.ParseMode.HTML
-        )
+        try:
+            await context.bot.send_message(
+                chat_id=DEVELOPER_ID, text=message, parse_mode=telegram.constants.ParseMode.HTML
+            )
+        except Exception as e:
+            logging.error(f"Failed to send error report to developer: {e}")
 
 @dataclass
 class ConstructedTelegramMessageFromQQ:
