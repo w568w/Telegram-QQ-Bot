@@ -7,6 +7,7 @@ requires-python = ">=3.13"
 dependencies = [
     "aiofiles>=24.1.0",
     # required by lottie[gif]
+    "aiosqlite>=0.22.1",
     "cairosvg>=2.8.2",
     # tg 表情转 gif
     "lottie[gif]>=0.7.2",

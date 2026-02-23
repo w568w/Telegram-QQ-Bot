@@ -17,7 +17,7 @@ import logging
 import os
 import asyncio
 from dotenv import load_dotenv
-import sqlite3
+import aiosqlite
 from dataclasses import dataclass
 import websockets
 import json
@@ -79,26 +79,28 @@ class DB:
         tg_user_id: int
         tg_username: Optional[str] = None
 
-    def __init__(self, db_path: str):
-        self.connection = sqlite3.connect(db_path)
-        self.connection.row_factory = sqlite3.Row
-        # Condition 用于在查询不到映射时等待 map_message 的 notify
+    def __init__(self, connection: aiosqlite.Connection):
+        self.connection = connection
+        self.connection.row_factory = aiosqlite.Row
         self._condition = asyncio.Condition()
-        with self.connection:
-            self.connection.execute(self.SavedMessageMapping.CREATE_TBL)
-            self.connection.execute(self.SavedUserMapping.CREATE_TBL)
+
+    @staticmethod
+    async def create(db_path: str) -> "DB":
+        """异步工厂方法，创建并初始化 DB 实例"""
+        connection = await aiosqlite.connect(db_path)
+        instance = DB(connection)
+        await connection.execute(instance.SavedMessageMapping.CREATE_TBL)
+        await connection.execute(instance.SavedUserMapping.CREATE_TBL)
+        await connection.commit()
+        return instance
 
     async def map_message(self, mapping: SavedMessageMapping):
         """将 QQ 消息和 TG 消息进行映射"""
-        with self.connection:
-            self.connection.execute(
-                "INSERT INTO saved_qq_messages (qq_message_id, tg_message_id) VALUES (?, ?)",
-                (
-                    mapping.qq_message_id,
-                    mapping.tg_message_id,
-                ),
-            )
-        # 通知所有等待 get_by_id 的协程
+        await self.connection.execute(
+            "INSERT INTO saved_qq_messages (qq_message_id, tg_message_id) VALUES (?, ?)",
+            (mapping.qq_message_id, mapping.tg_message_id),
+        )
+        await self.connection.commit()
         async with self._condition:
             self._condition.notify_all()
 
@@ -107,66 +109,60 @@ class DB:
         wait_start_time = asyncio.get_event_loop().time()
         async with self._condition:
             while True:
-                cursor = self.connection.cursor()
                 if type_ == "qq":
-                    cursor.execute(
+                    cursor = await self.connection.execute(
                         "SELECT * FROM saved_qq_messages WHERE qq_message_id = ?",
                         (id,),
                     )
                 elif type_ == "tg":
-                    cursor.execute(
+                    cursor = await self.connection.execute(
                         "SELECT * FROM saved_qq_messages WHERE tg_message_id = ?",
                         (id,),
                     )
                 else:
                     raise ValueError("type_ must be either 'qq' or 'tg'")
 
-                row = cursor.fetchone()
+                row = await cursor.fetchone()
                 if row is not None:
                     return self.SavedMessageMapping(
                         qq_message_id=row["qq_message_id"],
                         tg_message_id=row["tg_message_id"],
                     )
-                # 未找到，且已经超时
                 if asyncio.get_event_loop().time() - wait_start_time > wait_timeout:
                     return None
-                # 未找到，等待被 map_message 通知
                 try:
                     await asyncio.wait_for(self._condition.wait(), timeout=wait_timeout)
                 except asyncio.TimeoutError:
                     return None
 
-    def bind_user(self, mapping: SavedUserMapping):
+    async def bind_user(self, mapping: SavedUserMapping):
         """绑定 QQ 用户和 TG 用户"""
-        with self.connection:
-            # 先删除已有的绑定关系
-            self.connection.execute(
-                "DELETE FROM saved_qq_mappings_v2 WHERE tg_user_id = ?",
-                (mapping.tg_user_id,),
-            )
-            # 插入新的绑定关系
-            self.connection.execute(
-                "INSERT INTO saved_qq_mappings_v2 (qq_user_id, tg_user_id, tg_username) VALUES (?, ?, ?)",
-                (mapping.qq_user_id, mapping.tg_user_id, mapping.tg_username),
-            )
+        await self.connection.execute(
+            "DELETE FROM saved_qq_mappings_v2 WHERE tg_user_id = ?",
+            (mapping.tg_user_id,),
+        )
+        await self.connection.execute(
+            "INSERT INTO saved_qq_mappings_v2 (qq_user_id, tg_user_id, tg_username) VALUES (?, ?, ?)",
+            (mapping.qq_user_id, mapping.tg_user_id, mapping.tg_username),
+        )
+        await self.connection.commit()
 
-    def get_user_by_id(self, id: int, type_: Literal["qq", "tg"]) -> Optional[SavedUserMapping]:
+    async def get_user_by_id(self, id: int, type_: Literal["qq", "tg"]) -> Optional[SavedUserMapping]:
         """根据 ID 获取绑定的用户"""
-        cursor = self.connection.cursor()
         if type_ == "qq":
-            cursor.execute(
+            cursor = await self.connection.execute(
                 "SELECT * FROM saved_qq_mappings_v2 WHERE qq_user_id = ?",
                 (id,),
             )
         elif type_ == "tg":
-            cursor.execute(
+            cursor = await self.connection.execute(
                 "SELECT * FROM saved_qq_mappings_v2 WHERE tg_user_id = ?",
                 (id,),
             )
         else:
             raise ValueError("type_ must be either 'qq' or 'tg'")
 
-        row = cursor.fetchone()
+        row = await cursor.fetchone()
         if row is None:
             return None
         return self.SavedUserMapping(
@@ -175,14 +171,13 @@ class DB:
             tg_username=row["tg_username"],
         )
 
-    def get_user_by_username(self, username: str) -> Optional[SavedUserMapping]:
+    async def get_user_by_username(self, username: str) -> Optional[SavedUserMapping]:
         """根据 Telegram 用户名获取绑定的用户"""
-        cursor = self.connection.cursor()
-        cursor.execute(
+        cursor = await self.connection.execute(
             "SELECT * FROM saved_qq_mappings_v2 WHERE tg_username = ?",
             (username,),
         )
-        row = cursor.fetchone()
+        row = await cursor.fetchone()
         if row is None:
             return None
         return self.SavedUserMapping(
@@ -191,11 +186,11 @@ class DB:
             tg_username=row["tg_username"],
         )
 
-    def close(self):
+    async def close(self):
         """关闭数据库连接"""
-        self.connection.close()
+        await self.connection.close()
 
-db = DB(db_path)
+db: DB
 
 app = ApplicationBuilder().token(bot_token).read_timeout(30.).write_timeout(30.).connection_pool_size(512).build()
 
@@ -234,7 +229,7 @@ async def bind_qq_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_username = from_user.username
 
     # 保存绑定关系
-    db.bind_user(DB.SavedUserMapping(qq_user_id=qq_id, tg_user_id=tg_user_id, tg_username=tg_username))
+    await db.bind_user(DB.SavedUserMapping(qq_user_id=qq_id, tg_user_id=tg_user_id, tg_username=tg_username))
     
     await message.reply_text(f"已成功绑定 QQ 号 {qq_id} 到您的 Telegram 账号。")
 
@@ -397,7 +392,7 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
                     # 处理 @username 格式
                     mentioned_username = message.text[entity.offset:entity.offset + entity.length]
                     username = mentioned_username[1:]  # 去掉 @ 符号
-                    user_mapping = db.get_user_by_username(username)
+                    user_mapping = await db.get_user_by_username(username)
                     if user_mapping:
                         text_segments.append({
                             "type": "at",
@@ -411,7 +406,7 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
                 elif entity.type == "text_mention":
                     # 处理直接 mention 用户的情况
                     mentioned_user = entity.user
-                    user_mapping = db.get_user_by_id(mentioned_user.id, "tg") if mentioned_user is not None else None
+                    user_mapping = (await db.get_user_by_id(mentioned_user.id, "tg")) if mentioned_user is not None else None
                     if user_mapping:
                         text_segments.append({
                             "type": "at",
@@ -819,7 +814,7 @@ class ConstructedTelegramMessageFromQQ:
                 parse_mode=telegram.constants.ParseMode.MARKDOWN_V2,
             )
         
-def render_qq_message_to_plain_markdown(
+async def render_qq_message_to_plain_markdown(
     messages: str | list[dict[str, Any]]
 ) -> str:
     """将单条 QQ 消息中的段转换为纯文本 Markdown 格式"""
@@ -832,7 +827,6 @@ def render_qq_message_to_plain_markdown(
                 text = msg.get("data", {}).get("text", "")
                 reply_text += escape_mdv2(text)
             case "image":
-                # 如果是图片，添加图片链接
                 image_url = msg.get("data", {}).get("url", "")
                 if image_url:
                     reply_text += f" [图片]({image_url}) "
@@ -844,14 +838,12 @@ def render_qq_message_to_plain_markdown(
                     try:
                         qq_id = int(at_qq_id_or_all)
                         logging.info(f"Processing QQ ID: {qq_id}")
-                        user_mapping = db.get_user_by_id(qq_id, "qq")
+                        user_mapping = await db.get_user_by_id(qq_id, "qq")
                         if user_mapping is not None:
-                            # 如果找到绑定的 TG 用户，转换为 TG 的 mention
                             at_name = user_mapping.tg_username or str(qq_id)
                             reply_text += mention_markdown(user_mapping.tg_user_id, at_name, version=2) + " "
                         else:
                             logging.info(f"QQ ID {qq_id} is not bound to any TG user.")
-                            # 如果没有绑定，显示 QQ 号
                             reply_text += escape_mdv2(f"@{at_qq_id_or_all} ")
                     except ValueError:
                         logging.error(f"Invalid QQ ID format: {at_qq_id_or_all}, treating as mention")
@@ -862,7 +854,7 @@ def render_qq_message_to_plain_markdown(
                 reply_text += escape_mdv2(f"[未知类型消息: {msg.get('type', 'unknown')}]")
     return reply_text
 
-def render_qq_message_to_reply_text(
+async def render_qq_message_to_reply_text(
     getmsg_raw_response: dict[str, Any]
 ) -> str:
     """将 QQ 消息的原始响应转换为回复文本"""
@@ -871,13 +863,13 @@ def render_qq_message_to_reply_text(
     if len(sender_name) == 0:
         sender_name = sender.get("nickname", "[???]")
     messages = getmsg_raw_response["message"]
-    reply_text = render_qq_message_to_plain_markdown(messages)
+    reply_text = await render_qq_message_to_plain_markdown(messages)
     result = escape_mdv2(f"[回复 {sender_name}: ")
     result += reply_text.strip()
     result += escape_mdv2("]\n")
     return result
 
-def render_qq_forward_message_to_texts(
+async def render_qq_forward_message_to_texts(
     messages: list[dict[str, Any]]
 ):
     """
@@ -893,7 +885,7 @@ def render_qq_forward_message_to_texts(
             sender_name = sender.get("nickname", "[???]")
         message_content = msg.get("message", [])
         result_text += f"{escape_mdv2(sender_name)}: "
-        result_text += render_qq_message_to_plain_markdown(message_content)
+        result_text += await render_qq_message_to_plain_markdown(message_content)
         result_text += "\n"
     return result_text
 
@@ -939,7 +931,7 @@ async def qq_message_handler(message: websockets.Data):
                                     qq_replied_to_msg = await qq_get_msg_info(
                                         reply_message_id
                                     )
-                                    reply_info_text = render_qq_message_to_reply_text(
+                                    reply_info_text = await render_qq_message_to_reply_text(
                                         qq_replied_to_msg
                                     )
                                 except Exception as e:
@@ -958,9 +950,8 @@ async def qq_message_handler(message: websockets.Data):
                             try:
                                 qq_id = int(at_qq_id_or_all)
                                 logging.info(f"Processing QQ ID: {qq_id}")
-                                user_mapping = db.get_user_by_id(qq_id, "qq")
+                                user_mapping = await db.get_user_by_id(qq_id, "qq")
                                 if user_mapping is not None:
-                                    # 如果找到绑定的 TG 用户，转换为 TG 的 mention
                                     at_name = user_mapping.tg_username or str(qq_id)
                                     tg_msg.text_context += mention_markdown(user_mapping.tg_user_id, at_name, version=2) + " "
                                 else:
@@ -1020,7 +1011,7 @@ async def qq_message_handler(message: websockets.Data):
                             try:
                                 forward_msg_data = await qq_get_forward_msg_info(forward_list_id)
                                 # 只渲染前 5 条消息
-                                tg_msg.text_context += render_qq_forward_message_to_texts(forward_msg_data.get("data", {}).get("messages", [])[:5])
+                                tg_msg.text_context += await render_qq_forward_message_to_texts(forward_msg_data.get("data", {}).get("messages", [])[:5])
                             except Exception as e:
                                 logging.error(f"Failed to get forward message info for ID {forward_list_id}: {e}")
                                 tg_msg.text_context += escape_mdv2("[无法获取转发消息内容]")
@@ -1230,7 +1221,15 @@ app.add_handlers(
     ]
 )
 app.add_error_handler(error_handler)
-loop = asyncio.get_event_loop()
-loop.create_task(websocket_handler())
+
+async def post_init(application: Application) -> None:
+    global db
+    db = await DB.create(db_path)
+    asyncio.create_task(websocket_handler())
+
+async def post_shutdown(application: Application) -> None:
+    await db.close()
+
+app.post_init = post_init
+app.post_shutdown = post_shutdown
 app.run_polling(allowed_updates=Update.ALL_TYPES)
-db.close()
