@@ -987,7 +987,10 @@ async def qq_message_handler(message: websockets.Data):
                                     url = info_data[key]
                                     break
                             if len(url) > 0:
-                                url = await parse_b23_url_if_any(url)
+                                try:
+                                    url = await parse_b23_url_if_any(url)
+                                except Exception as e:
+                                    logging.warning(f"Failed to parse b23 URL {url}: {e}")
                             desc = info_data.get("desc", "")
                             tag = info_data.get("tag", "")
                             tg_msg.text_context += escape_mdv2("[卡片分享]\n")
