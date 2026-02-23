@@ -1118,58 +1118,91 @@ async def qq_message_handler(message: websockets.Data):
         )
     )
 
+_background_tasks: set[asyncio.Task] = set()
+
 async def websocket_handler():
-    """WebSocket 处理函数，监听 QQ 方面的消息"""
+    """WebSocket 处理函数，监听 QQ 方面的消息，断连后自动重连"""
 
-    logging.info(f"Connecting to WebSocket at {NAPCAT_URL}")
+    WS_RECONNECT_BASE_DELAY = 1.0
+    WS_RECONNECT_MAX_DELAY = 60.0
 
-    async with websockets.connect(NAPCAT_URL) as websocket:
-        websocket_recv = asyncio.create_task(websocket.recv())
-        ws_send_task_queue_recv = asyncio.create_task(ws_send_task_queue.get())
-        cur_waiting_tasks = {}
-        def handle_server_response(maybe_data: websockets.Data):
-            """处理服务器响应"""
-            try:
-                data = json.loads(maybe_data)
-                if "echo" in data:
-                    echo = data["echo"]
-                    if echo in cur_waiting_tasks:
-                        completion = cur_waiting_tasks.pop(echo)
-                        try:
-                            completion.set_result(data)
-                        except asyncio.InvalidStateError:
-                            logging.warning(f"Completion for echo {echo} already set or cancelled")
-                        ws_send_task_queue.task_done()
-                    else:
-                        logging.warning(f"Received echo {echo} but no task found")
-            except json.JSONDecodeError:
-                logging.error(f"Failed to decode JSON from WebSocket: {maybe_data}")
-                return
+    reconnect_delay = WS_RECONNECT_BASE_DELAY
+    while True:
+        cur_waiting_tasks: dict[str, asyncio.Future] = {}
+        websocket_recv: asyncio.Task | None = None
+        ws_send_task_queue_recv: asyncio.Task | None = None
+        try:
+            logging.info(f"Connecting to WebSocket at {NAPCAT_URL}")
+            async with websockets.connect(NAPCAT_URL) as websocket:
+                logging.info("WebSocket connected successfully")
+                reconnect_delay = WS_RECONNECT_BASE_DELAY
 
-        while True:
-            done, pending = await asyncio.wait(
-                [websocket_recv, ws_send_task_queue_recv],
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            for task in done:
-                if task is websocket_recv:
-                    message = task.result()
-                    logging.info(f"Received message from WebSocket: {message}")
-                    handle_server_response(message)
-                    asyncio.create_task(qq_message_handler(message))
-                    websocket_recv = asyncio.create_task(websocket.recv()) # 重新创建接收任务
-                elif task is ws_send_task_queue_recv:
-                    action, params, echo, completion = task.result()
-                    logging.info(f"Sending message to WebSocket: {action}, {params}")
-                    await websocket.send(
-                        json.dumps({
-                            "action": action,
-                            "params": params,
-                            "echo": echo,
-                        })
+                websocket_recv = asyncio.create_task(websocket.recv())
+                ws_send_task_queue_recv = asyncio.create_task(ws_send_task_queue.get())
+
+                def handle_server_response(maybe_data: websockets.Data):
+                    """处理服务器响应"""
+                    try:
+                        data = json.loads(maybe_data)
+                        if "echo" in data:
+                            echo = data["echo"]
+                            if echo in cur_waiting_tasks:
+                                completion = cur_waiting_tasks.pop(echo)
+                                try:
+                                    completion.set_result(data)
+                                except asyncio.InvalidStateError:
+                                    logging.warning(f"Completion for echo {echo} already set or cancelled")
+                            else:
+                                logging.warning(f"Received echo {echo} but no task found")
+                    except json.JSONDecodeError:
+                        logging.error(f"Failed to decode JSON from WebSocket: {maybe_data}")
+                        return
+
+                while True:
+                    done, _pending = await asyncio.wait(
+                        [websocket_recv, ws_send_task_queue_recv],
+                        return_when=asyncio.FIRST_COMPLETED,
                     )
-                    cur_waiting_tasks[echo] = completion
-                    ws_send_task_queue_recv = asyncio.create_task(ws_send_task_queue.get()) # 重新创建发送任务
+                    for task in done:
+                        if task is websocket_recv:
+                            message = task.result()
+                            logging.info(f"Received message from WebSocket: {message}")
+                            handle_server_response(message)
+                            bg_task = asyncio.create_task(qq_message_handler(message))
+                            _background_tasks.add(bg_task)
+                            bg_task.add_done_callback(_background_tasks.discard)
+                            websocket_recv = asyncio.create_task(websocket.recv())
+                        elif task is ws_send_task_queue_recv:
+                            action, params, echo, completion = task.result()
+                            logging.info(f"Sending message to WebSocket: {action}, {params}")
+                            await websocket.send(
+                                json.dumps({
+                                    "action": action,
+                                    "params": params,
+                                    "echo": echo,
+                                })
+                            )
+                            cur_waiting_tasks[echo] = completion
+                            ws_send_task_queue_recv = asyncio.create_task(ws_send_task_queue.get())
+
+        except Exception as e:
+            logging.error(f"WebSocket connection error: {e}")
+            traceback.print_exc()
+        finally:
+            # 清理：取消未完成的内部 task
+            for t in [websocket_recv, ws_send_task_queue_recv]:
+                if t is not None and not t.done():
+                    t.cancel()
+            # 清理：对所有 pending Future 设置异常，解除调用方的阻塞
+            disconnect_err = ConnectionError("WebSocket disconnected")
+            for echo, completion in cur_waiting_tasks.items():
+                if not completion.done():
+                    completion.set_exception(disconnect_err)
+            cur_waiting_tasks.clear()
+
+        logging.info(f"WebSocket reconnecting in {reconnect_delay:.1f}s...")
+        await asyncio.sleep(reconnect_delay)
+        reconnect_delay = min(reconnect_delay * 2, WS_RECONNECT_MAX_DELAY)
 
 async def parse_b23_url_if_any(url: str) -> str:
     """
