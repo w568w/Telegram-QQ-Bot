@@ -515,6 +515,7 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
 
 from ffmpeg.asyncio import FFmpeg
 FFMPEG_EXECUTABLE = os.getenv("FFMPEG_EXECUTABLE", "ffmpeg-7.0.2-amd64-static/ffmpeg")
+FFMPEG_TIMEOUT = 60.0
 
 # 添加缓存配置
 CACHE_DIR = os.getenv("CACHE_DIR", "runtime")
@@ -558,7 +559,7 @@ async def get_converted_image_with_cache(file_obj: telegram.File, file_path: str
             .option("filter_complex", "split[a][b];[a]palettegen=reserve_transparent=on:stats_mode=single[p];[b][p]paletteuse=alpha_threshold=128")
             .output("pipe:1", f="gif")
         )
-        converted_data = await ffmpeg.execute(bytes(img_data))
+        converted_data = await ffmpeg.execute(bytes(img_data), timeout=FFMPEG_TIMEOUT)
     elif file_path.lower().endswith(".mp4"):
         # MP4 转 GIF
         # FFMpeg 不支持 MP4 的流式输入，因此需要先保存到临时文件
@@ -574,7 +575,7 @@ async def get_converted_image_with_cache(file_obj: telegram.File, file_path: str
                 .input(temp_file_path)
                 .output("pipe:1", f="gif")
             )
-            converted_data = await ffmpeg.execute()
+            converted_data = await ffmpeg.execute(timeout=FFMPEG_TIMEOUT)
     elif file_path.lower().endswith(".tgs"):
         # TGS 转 GIF
         def process_tgs_to_gif(data: bytes) -> bytes:
@@ -641,7 +642,7 @@ async def get_converted_voice_with_cache(file_url: str | telegram.File, file_uni
             .input("pipe:0")
             .output("pipe:1", f="amr_nb")
         )
-        converted_data = await ffmpeg.execute(bytes(voice_data))
+        converted_data = await ffmpeg.execute(bytes(voice_data), timeout=FFMPEG_TIMEOUT)
     elif mime_type_or_ext.endswith("amr"):
         # AMR 转 OGG
         ffmpeg = (
@@ -649,7 +650,7 @@ async def get_converted_voice_with_cache(file_url: str | telegram.File, file_uni
             .input("pipe:0")
             .output("pipe:1", f="ogg")
         )
-        converted_data = await ffmpeg.execute(bytes(voice_data))
+        converted_data = await ffmpeg.execute(bytes(voice_data), timeout=FFMPEG_TIMEOUT)
     else:
         # 其他格式不转码，直接使用原始数据
         converted_data = voice_data
