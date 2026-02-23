@@ -667,54 +667,34 @@ def encode_bytearray_to_base64_uri(data: bytes) -> str:
     return "base64://" + base64.b64encode(data).decode('utf-8')
 
 ws_send_task_queue = asyncio.Queue()
-async def qq_send_msg_in_group(single_qq_msg: list[dict[str, Any]]) -> int:
-    """发送单条消息到 QQ 群组"""
-    logging.info(f"\n\nSending msg: {single_qq_msg}\n\n")
-    action = "send_group_msg"
-    params = {
-        "group_id": QQ_GROUP_ID,
-        "message": single_qq_msg,
-    }
+WS_RESPONSE_TIMEOUT = 30.0
+
+async def _ws_request(action: str, params: dict[str, Any]) -> dict[str, Any]:
+    """向 WebSocket 发送请求并等待响应，带超时保护"""
     echo = str(uuid.uuid4())
     loop = asyncio.get_running_loop()
     completion = loop.create_future()
-    # 将消息发送到 WebSocket 队列，在 websocket_handler 中处理
     await ws_send_task_queue.put((action, params, echo, completion))
-    # 等待结果
-    result = await completion
+    return await asyncio.wait_for(completion, timeout=WS_RESPONSE_TIMEOUT)
+
+async def qq_send_msg_in_group(single_qq_msg: list[dict[str, Any]]) -> int:
+    """发送单条消息到 QQ 群组"""
+    logging.info(f"\n\nSending msg: {single_qq_msg}\n\n")
+    result = await _ws_request("send_group_msg", {
+        "group_id": QQ_GROUP_ID,
+        "message": single_qq_msg,
+    })
     return result["data"]["message_id"]
 
 async def qq_get_msg_info(qq_msg_id: int) -> dict[str, Any]:
     """获取单条 QQ 消息的详细内容"""
     logging.info(f"\n\nGetting msg ID: {qq_msg_id}\n\n")
-    action = "get_msg"
-    params = {
-        "message_id": qq_msg_id,
-    }
-    echo = str(uuid.uuid4())
-    loop = asyncio.get_running_loop()
-    completion = loop.create_future()
-    # 将消息发送到 WebSocket 队列，在 websocket_handler 中处理
-    await ws_send_task_queue.put((action, params, echo, completion))
-    # 等待结果
-    result = await completion
-    return result
+    return await _ws_request("get_msg", {"message_id": qq_msg_id})
 
 async def qq_get_forward_msg_info(forward_list_id: str) -> dict[str, Any]:
     """获取 QQ 转发消息的详细内容"""
     logging.info(f"\n\nGetting forward msg ID: {forward_list_id}\n\n")
-    action = "get_forward_msg"
-    params = {
-        "message_id": forward_list_id,
-    }
-    echo = str(uuid.uuid4())
-    loop = asyncio.get_running_loop()
-    completion = loop.create_future()
-    # 将消息发送到 WebSocket 队列，在 websocket_handler 中处理
-    await ws_send_task_queue.put((action, params, echo, completion))
-    # 等待结果
-    result = await completion
-    return result
+    return await _ws_request("get_forward_msg", {"message_id": forward_list_id})
 
 async def debug_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """调试处理函数，打印接收到的更新"""
@@ -1231,12 +1211,15 @@ async def retry_on_network_error(func, wait_sec=3, try_count=3, *args, **kwargs)
     """
     纯工具函数，用于在 tg 发送消息时遇到网络错误时进行重试
     """
+    last_error: Optional[Exception] = None
     for attempt in range(try_count):
         try:
             return await func(*args, **kwargs)
         except telegram.error.NetworkError as e:
+            last_error = e
             logging.exception(f"Network error on attempt {attempt + 1}: {e}")
             await asyncio.sleep(wait_sec)
+    raise last_error  # type: ignore[misc]
 
 app.add_handlers(
     [
