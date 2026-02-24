@@ -112,7 +112,7 @@ class DB:
             while True:
                 if type_ == "qq":
                     cursor = await self.connection.execute(
-                        "SELECT * FROM saved_qq_messages WHERE qq_message_id = ?",
+                        "SELECT * FROM saved_qq_messages WHERE qq_message_id = ? ORDER BY tg_message_id DESC LIMIT 1",
                         (id,),
                     )
                 elif type_ == "tg":
@@ -623,8 +623,10 @@ async def get_converted_voice_with_cache(file_url: str | telegram.File, file_uni
     logging.info(f"Cache miss, downloading and converting voice: {file_unique_id}")
     voice_data: bytes
     if isinstance(file_url, telegram.File):
+        # 如果是 File 对象，直接下载
         voice_data = bytes(await file_url.download_as_bytearray())
     else:
+        # 如果是 URL，使用 httpx 下载
         async with httpx.AsyncClient() as client:
             response = await client.get(file_url, timeout=10)
         if response.status_code != 200:
@@ -1095,22 +1097,19 @@ async def qq_message_handler(message: websockets.Data):
         logging.warning(f"Received message without a valid QQ message ID, skipping mapping: {message_data}")
         return
 
-    tg_message_id = None
-    for sent_msg in reversed(tg_sent_msgs):
+    any_mapped = False
+    for sent_msg in tg_sent_msgs:
         if sent_msg is not None:
-            tg_message_id = sent_msg.message_id
-            break
+            await db.map_message(
+                DB.SavedMessageMapping(
+                    qq_message_id=int(qq_message_id),
+                    tg_message_id=sent_msg.message_id,
+                )
+            )
+            any_mapped = True
 
-    if tg_message_id is None:
+    if not any_mapped:
         logging.warning(f"Failed to send message to Telegram, skipping mapping for QQ message ID {qq_message_id}")
-        return
-
-    await db.map_message(
-        DB.SavedMessageMapping(
-            qq_message_id=int(qq_message_id),
-            tg_message_id=tg_message_id,
-        )
-    )
 
 _background_tasks: set[asyncio.Task] = set()
 
