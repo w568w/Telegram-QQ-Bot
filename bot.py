@@ -349,7 +349,7 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
             # 处理语音消息（OGG）
             voice_file = await message.voice.get_file()
             if voice_file.file_path is not None:
-                voice_data = await get_converted_voice_with_cache(voice_file, voice_file.file_unique_id, voice_file.file_path)
+                voice_data = await get_converted_voice_with_cache(voice_file, voice_file.file_unique_id)
                 single_qq_msg.append(
                     {
                         "type": "record",
@@ -593,13 +593,21 @@ async def get_converted_image_with_cache(file_obj: telegram.File, file_path: str
     
     return converted_data
 
+def detect_audio_format(data: bytes) -> str | None:
+    """通过 magic header 检测音频格式。"""
+    if data[:4] == b'OggS':
+        return "ogg"
+    if data[:5] == b'#!AMR':
+        return "amr"
+    return None
+
 @overload
 async def get_converted_voice_with_cache(file_url: str, file_unique_id: str) -> bytes:
     ...
 @overload
-async def get_converted_voice_with_cache(file_url: telegram.File, file_unique_id: str, file_path: str) -> bytes:
+async def get_converted_voice_with_cache(file_url: telegram.File, file_unique_id: str) -> bytes:
     ...
-async def get_converted_voice_with_cache(file_url: str | telegram.File, file_unique_id: str, file_path: Optional[str] = None) -> bytes:
+async def get_converted_voice_with_cache(file_url: str | telegram.File, file_unique_id: str) -> bytes:
     """
     通过 unique_id 获取转码后的语音，如果缓存不存在则下载并转码
 
@@ -614,40 +622,35 @@ async def get_converted_voice_with_cache(file_url: str | telegram.File, file_uni
     # 缓存不存在，下载并转码
     logging.info(f"Cache miss, downloading and converting voice: {file_unique_id}")
     voice_data: bytes
-    mime_type_or_ext = file_path.lower() if file_path else None
     if isinstance(file_url, telegram.File):
-        # 如果是 File 对象，直接下载
         voice_data = bytes(await file_url.download_as_bytearray())
     else:
-        # 如果是 URL，使用 httpx 下载
         async with httpx.AsyncClient() as client:
             response = await client.get(file_url, timeout=10)
         if response.status_code != 200:
             logging.error(f"Failed to download voice file from {file_url}, status code: {response.status_code}")
             raise RuntimeError(f"Failed to download voice file from {file_url}")
         voice_data = response.content
-        mime_type_or_ext = response.headers.get("Content-Type", "").lower()
-    
-    assert mime_type_or_ext is not None and isinstance(mime_type_or_ext, str), "mime_type_or_ext must be a string"
 
-    if mime_type_or_ext.endswith("ogg"):
-        # OGG 转 AMR
+    audio_fmt = detect_audio_format(voice_data)
+    if audio_fmt == "ogg":
+        # OGG -> AMR (Telegram -> QQ)
         ffmpeg = (
             FFmpeg(FFMPEG_EXECUTABLE)
             .input("pipe:0")
             .output("pipe:1", f="amr_nb")
         )
         converted_data = await ffmpeg.execute(bytes(voice_data), timeout=FFMPEG_TIMEOUT)
-    elif mime_type_or_ext.endswith("amr"):
-        # AMR 转 OGG
+    elif audio_fmt == "amr":
+        # AMR -> OGG Opus (QQ -> Telegram)
         ffmpeg = (
             FFmpeg(FFMPEG_EXECUTABLE)
             .input("pipe:0")
-            .output("pipe:1", f="ogg")
+            .output("pipe:1", f="ogg", acodec="libopus")
         )
         converted_data = await ffmpeg.execute(bytes(voice_data), timeout=FFMPEG_TIMEOUT)
     else:
-        # 其他格式不转码，直接使用原始数据
+        logging.warning(f"Unknown voice format (magic bytes: {voice_data[:8]!r}), skipping conversion")
         converted_data = voice_data
     
     # 保存到缓存
