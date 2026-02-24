@@ -196,12 +196,14 @@ app = ApplicationBuilder().token(bot_token).read_timeout(30.).write_timeout(30.)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    assert update.message is not None
+    if update.message is None:
+        return
     await update.message.reply_text("Hello!")
 
 async def bind_qq_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """处理 /bindqq 命令"""
-    assert update.message is not None
+    if update.message is None:
+        return
     message = update.message
     
     # 检查是否在允许的群组中
@@ -239,9 +241,10 @@ def escape_mdv2(text: str) -> str:
     return escape_markdown(text, version=2)
 
 async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logging.info(f"\n\nReceived update: {update}\n\n")
     """处理群组消息"""
-    assert update.message is not None
+    logging.info(f"\n\nReceived update: {update}\n\n")
+    if update.message is None:
+        return
     message = update.message
 
     if message.chat.id not in group_ids:
@@ -481,7 +484,7 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         error_msg += f"Error ID: {err_id}\n"
         error_msg += f"Error message: {escape_mdv2(str(e))}\n"
         error_msg += f"Error traceback: {escape_mdv2(traceback.format_exc())}\n"
-        error_msg += f"Original message data: {escape_mdv2(json.dumps(message, indent=2, ensure_ascii=False))}"
+        error_msg += f"Original message data: {escape_mdv2(json.dumps(message.to_dict(), indent=2, ensure_ascii=False))}"
         logging.error(error_msg)
         logging.error("=" * 32)
         # 尝试发送错误消息到 Telegram
@@ -1032,15 +1035,20 @@ async def qq_message_handler(message: websockets.Data):
                         face_id: str = msg.get("data", {}).get("id")
                         tg_msg.text_context += escape_mdv2(f" [表情 {face_id}] ")
                     case "record":
-                        if tg_msg.has_media:
-                            # 如果已经有媒体内容，发送当前消息并重置
-                            tg_sent_msgs.append(await tg_msg.send_to_telegram(default_tg_chat_id, app))
-                            tg_msg.reset()
                         voice_url = msg.get("data", {}).get("url")
-                        tg_msg.voice_data = await get_converted_voice_with_cache(voice_url, sha3_256(voice_url.encode()).hexdigest())
+                        if voice_url is None:
+                            tg_msg.text_context += escape_mdv2("[语音消息无法获取]")
+                        else:
+                            if tg_msg.has_media:
+                                tg_sent_msgs.append(await tg_msg.send_to_telegram(default_tg_chat_id, app))
+                                tg_msg.reset()
+                            tg_msg.voice_data = await get_converted_voice_with_cache(voice_url, sha3_256(voice_url.encode()).hexdigest())
                     case "video":
-                        video_url: str = msg.get("data", {}).get("url")
-                        tg_msg.text_context += f" [视频]({video_url}) "
+                        video_url = msg.get("data", {}).get("url")
+                        if video_url is not None:
+                            tg_msg.text_context += f" [视频]({video_url}) "
+                        else:
+                            tg_msg.text_context += escape_mdv2("[视频消息无法获取]")
                     case "file":
                         tg_msg.text_context += escape_mdv2(" [文件] ")
                     case _:
@@ -1242,7 +1250,9 @@ app.add_error_handler(error_handler)
 async def post_init(application: Application) -> None:
     global db
     db = await DB.create(db_path)
-    asyncio.create_task(websocket_handler())
+    ws_task = asyncio.create_task(websocket_handler())
+    _background_tasks.add(ws_task)
+    ws_task.add_done_callback(_background_tasks.discard)
 
 async def post_shutdown(application: Application) -> None:
     await db.close()
