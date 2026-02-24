@@ -17,6 +17,7 @@ import logging
 import os
 import asyncio
 from dotenv import load_dotenv
+import aiofiles
 import aiosqlite
 from dataclasses import dataclass
 import websockets
@@ -97,7 +98,7 @@ class DB:
     async def map_message(self, mapping: SavedMessageMapping):
         """将 QQ 消息和 TG 消息进行映射"""
         await self.connection.execute(
-            "INSERT INTO saved_qq_messages (qq_message_id, tg_message_id) VALUES (?, ?)",
+            "INSERT OR IGNORE INTO saved_qq_messages (qq_message_id, tg_message_id) VALUES (?, ?)",
             (mapping.qq_message_id, mapping.tg_message_id),
         )
         await self.connection.commit()
@@ -541,8 +542,8 @@ async def get_converted_image_with_cache(file_obj: telegram.File, file_path: str
     # 检查缓存
     if os.path.exists(cache_path):
         logging.info(f"Using cached file: {cache_path}")
-        with open(cache_path, "rb") as f:
-            return f.read()
+        async with aiofiles.open(cache_path, "rb") as f:
+            return await f.read()
     
     # 缓存不存在，下载并转码
     logging.info(f"Cache miss, downloading and converting: {file_unique_id}")
@@ -590,8 +591,8 @@ async def get_converted_image_with_cache(file_obj: telegram.File, file_path: str
         converted_data = bytes(img_data)
     
     # 保存到缓存
-    with open(cache_path, "wb") as f:
-        f.write(converted_data)
+    async with aiofiles.open(cache_path, "wb") as f:
+        await f.write(converted_data)
     logging.info(f"Cached converted file: {cache_path}")
     
     return converted_data
@@ -611,8 +612,8 @@ async def get_converted_voice_with_cache(file_url: str | telegram.File, file_uni
     cache_path = os.path.join(CONVERTED_VOICE_CACHE_DIR, file_unique_id)
     if os.path.exists(cache_path):
         logging.info(f"Using cached voice file: {cache_path}")
-        with open(cache_path, "rb") as f:
-            return f.read()
+        async with aiofiles.open(cache_path, "rb") as f:
+            return await f.read()
 
     # 缓存不存在，下载并转码
     logging.info(f"Cache miss, downloading and converting voice: {file_unique_id}")
@@ -654,8 +655,8 @@ async def get_converted_voice_with_cache(file_url: str | telegram.File, file_uni
         converted_data = voice_data
     
     # 保存到缓存
-    with open(cache_path, "wb") as f:
-        f.write(converted_data)
+    async with aiofiles.open(cache_path, "wb") as f:
+        await f.write(converted_data)
     logging.info(f"Cached converted voice file: {cache_path}")
     return converted_data
 
@@ -700,17 +701,13 @@ async def debug_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logging.info(f"\n\nReceived update: {update}\n\n")
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    import html
     """错误处理函数，打印错误信息"""
+    import html
     logging.error("Exception while handling an update:", exc_info=context.error)
 
-    # traceback.format_exception returns the usual python message about an exception, but as a
-    # list of strings rather than a single string, so we have to join them together.
     tb_list = traceback.format_exception(None, context.error, context.error.__traceback__ if context.error else None)
     tb_string = "".join(tb_list)
 
-    # Build the message with some markup and additional information about what happened.
-    # You might need to add some logic to deal with messages longer than the 4096 character limit.
     update_str = update.to_dict() if isinstance(update, Update) else str(update)
     message = (
         "An exception was raised while handling an update\n"
@@ -721,7 +718,10 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
         f"<pre>{html.escape(tb_string)}</pre>"
     )
 
-    # Finally, send the message
+    MAX_TG_MSG_LEN = 4000
+    if len(message) > MAX_TG_MSG_LEN:
+        message = message[:MAX_TG_MSG_LEN] + "\n... (truncated)"
+
     if DEVELOPER_ID is not None:
         try:
             await context.bot.send_message(
@@ -1222,7 +1222,7 @@ async def parse_b23_url_if_any(url: str) -> str:
             logging.warning(f"Failed to resolve Bilibili URL {url}, status code: {response.status_code}")
             return url
 
-async def retry_on_network_error(func, wait_sec=3, try_count=3, *args, **kwargs):
+async def retry_on_network_error(func, *args, wait_sec=3, try_count=3, **kwargs):
     """
     纯工具函数，用于在 tg 发送消息时遇到网络错误时进行重试
     """
