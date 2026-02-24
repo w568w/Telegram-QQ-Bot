@@ -478,30 +478,26 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
 
         qq_message_id = await qq_send_msg_in_group(single_qq_msg)
     except Exception as e:
-        # 捕获解析过程中的任何错误
         err_id = str(uuid.uuid4())
         logging.error("=" * 32)
-        error_msg = "Error occurred while processing Telegram message -> QQ\n"
-        error_msg += f"Error ID: {err_id}\n"
-        error_msg += f"Error message: {escape_mdv2(str(e))}\n"
-        error_msg += f"Error traceback: {escape_mdv2(traceback.format_exc())}\n"
-        error_msg += f"Original message data: {escape_mdv2(json.dumps(message.to_dict(), indent=2, ensure_ascii=False))}"
-        logging.error(error_msg)
+        logging.error(f"Error ID: {err_id}")
+        logging.error(f"Error processing TG->QQ: {e}")
+        logging.error(traceback.format_exc())
+        logging.error(f"Original message: {json.dumps(message.to_dict(), indent=2, ensure_ascii=False)}")
         logging.error("=" * 32)
-        # 尝试发送错误消息到 Telegram
         try:
             qq_message_id = await qq_send_msg_in_group(
                 [
                     {
                         "type": "text",
                         "data": {
-                            "text": error_msg,
+                            "text": f"[消息转发失败，错误 ID: {err_id}]",
                         },
                     }
                 ]
             )
         except Exception as e:
-            logging.error(f"Still failed to send error log to Telegram: {e}")
+            logging.error(f"Failed to send error notice to QQ: {e}")
             traceback.print_exc()
     # 保存映射关系
     if qq_message_id is not None:
@@ -517,12 +513,12 @@ FFMPEG_EXECUTABLE = os.getenv("FFMPEG_EXECUTABLE", "ffmpeg-7.0.2-amd64-static/ff
 FFMPEG_TIMEOUT = 60.0
 
 # 添加缓存配置
-CACHE_DIR = os.getenv("CACHE_DIR", "runtime")
-os.makedirs(CACHE_DIR, exist_ok=True)
-CONVERTED_IMAGE_CACHE_DIR = Path(CACHE_DIR) / "image_cache"
-os.makedirs(CONVERTED_IMAGE_CACHE_DIR, exist_ok=True)
-CONVERTED_VOICE_CACHE_DIR = Path(CACHE_DIR) / "voice_cache"
-os.makedirs(CONVERTED_VOICE_CACHE_DIR, exist_ok=True)
+CACHE_DIR = Path(os.getenv("CACHE_DIR", "runtime"))
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+CONVERTED_IMAGE_CACHE_DIR = CACHE_DIR / "image_cache"
+CONVERTED_IMAGE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+CONVERTED_VOICE_CACHE_DIR = CACHE_DIR / "voice_cache"
+CONVERTED_VOICE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 from lottie.importers import importers
 from lottie.exporters import exporters
@@ -537,10 +533,10 @@ async def get_converted_image_with_cache(file_obj: telegram.File, file_path: str
     仅处理从 tg 到 qq 的转码
     """
     # 直接用 unique_id 作为缓存文件名
-    cache_path = os.path.join(CONVERTED_IMAGE_CACHE_DIR, file_unique_id)
+    cache_path = CONVERTED_IMAGE_CACHE_DIR / file_unique_id
     
     # 检查缓存
-    if os.path.exists(cache_path):
+    if cache_path.exists():
         logging.info(f"Using cached file: {cache_path}")
         async with aiofiles.open(cache_path, "rb") as f:
             return await f.read()
@@ -609,8 +605,8 @@ async def get_converted_voice_with_cache(file_url: str | telegram.File, file_uni
 
     注意，与图片不同，语音在双向都需要转码（tg .ogg -> qq .amr, qq .amr -> tg .ogg）
     """
-    cache_path = os.path.join(CONVERTED_VOICE_CACHE_DIR, file_unique_id)
-    if os.path.exists(cache_path):
+    cache_path = CONVERTED_VOICE_CACHE_DIR / file_unique_id
+    if cache_path.exists():
         logging.info(f"Using cached voice file: {cache_path}")
         async with aiofiles.open(cache_path, "rb") as f:
             return await f.read()
@@ -1097,9 +1093,9 @@ async def qq_message_handler(message: websockets.Data):
         return
 
     tg_message_id = None
-    for tg_msg in reversed(tg_sent_msgs):
-        if tg_msg is not None:
-            tg_message_id = tg_msg.message_id
+    for sent_msg in reversed(tg_sent_msgs):
+        if sent_msg is not None:
+            tg_message_id = sent_msg.message_id
             break
 
     if tg_message_id is None:
@@ -1184,16 +1180,32 @@ async def websocket_handler():
             logging.error(f"WebSocket connection error: {e}")
             traceback.print_exc()
         finally:
+            disconnect_err = ConnectionError("WebSocket disconnected")
             # 清理：取消未完成的内部 task
             for t in [websocket_recv, ws_send_task_queue_recv]:
                 if t is not None and not t.done():
                     t.cancel()
-            # 清理：对所有 pending Future 设置异常，解除调用方的阻塞
-            disconnect_err = ConnectionError("WebSocket disconnected")
+            # 如果 ws_send_task_queue_recv 已完成但尚未处理，取出其 Future 并设异常
+            if ws_send_task_queue_recv is not None and ws_send_task_queue_recv.done() and not ws_send_task_queue_recv.cancelled():
+                try:
+                    _, _, _, completion = ws_send_task_queue_recv.result()
+                    if not completion.done():
+                        completion.set_exception(disconnect_err)
+                except Exception:
+                    pass
+            # 清理：对所有已发出但未收到响应的请求设置异常
             for echo, completion in cur_waiting_tasks.items():
                 if not completion.done():
                     completion.set_exception(disconnect_err)
             cur_waiting_tasks.clear()
+            # 清空队列中积压的未发送请求
+            while not ws_send_task_queue.empty():
+                try:
+                    _, _, _, completion = ws_send_task_queue.get_nowait()
+                    if not completion.done():
+                        completion.set_exception(disconnect_err)
+                except asyncio.QueueEmpty:
+                    break
 
         logging.info(f"WebSocket reconnecting in {reconnect_delay:.1f}s...")
         await asyncio.sleep(reconnect_delay)
