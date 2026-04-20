@@ -4,6 +4,7 @@ from typing import Any, Literal, Optional, ClassVar, TypeVar, overload, cast
 import uuid
 from telegram import Message, Update, ReplyParameters
 import telegram
+from telegram.error import NetworkError, TimedOut
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -13,6 +14,7 @@ from telegram.ext import (
     ContextTypes,
 )
 from telegram.helpers import mention_markdown
+from telegram.request import HTTPXRequest
 import logging
 import os
 import asyncio
@@ -30,6 +32,103 @@ load_dotenv()
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
+# httpx 的 INFO 日志对每次请求都打一行，非常吵；调到 WARNING 保留真正的异常信息
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
+
+class ResilientHTTPXRequest(HTTPXRequest):
+    """
+    在 HTTPXRequest 之上提供自愈能力的封装：
+    - 连续若干次 TimedOut / NetworkError 后，自动 shutdown + initialize 底层 httpx.AsyncClient，
+      用来规避 httpx / httpcore 的连接池陷入坏状态（例如因代理抽风后 pool 里残留
+      永不释放的 tunnel 连接、但 max_connections 又耗尽的情况）的故障。
+    - 有 cooldown 避免反复重建。
+    - 关键事件统一走 WARNING / ERROR 级别日志，避免 PTB 内置的 _LOGGER.debug 静默吞错。
+    """
+
+    def __init__(
+        self,
+        *args,
+        max_consecutive_failures: int = 5,
+        reset_cooldown: float = 30.0,
+        label: str = "httpx",
+        **kwargs,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self._consecutive_failures: int = 0
+        self._reset_lock: asyncio.Lock = asyncio.Lock()
+        self._max_failures: int = max_consecutive_failures
+        self._reset_cooldown: float = reset_cooldown
+        self._last_reset_at: float = 0.0
+        self._label: str = label
+
+    @property
+    def consecutive_failures(self) -> int:
+        """最近连续失败次数（成功一次即清零）"""
+        return self._consecutive_failures
+
+    @property
+    def last_reset_at(self) -> float:
+        """上次主动重建 client 的事件循环时刻"""
+        return self._last_reset_at
+
+    async def do_request(self, *args, **kwargs):
+        try:
+            result = await super().do_request(*args, **kwargs)
+        except (TimedOut, NetworkError) as e:
+            self._consecutive_failures += 1
+            logging.warning(
+                "[%s] network failure %d/%d: %s: %s",
+                self._label,
+                self._consecutive_failures,
+                self._max_failures,
+                type(e).__name__,
+                e,
+            )
+            if self._consecutive_failures >= self._max_failures:
+                # 放到后台跑，避免阻塞当前失败请求的异常传播链
+                asyncio.create_task(self._maybe_reset_client())
+            raise
+        else:
+            if self._consecutive_failures:
+                logging.info(
+                    "[%s] recovered after %d consecutive failures",
+                    self._label,
+                    self._consecutive_failures,
+                )
+            self._consecutive_failures = 0
+            return result
+
+    async def _maybe_reset_client(self) -> None:
+        """尝试重建底层 httpx.AsyncClient。有 cooldown 防抖。"""
+        async with self._reset_lock:
+            now = asyncio.get_event_loop().time()
+            if now - self._last_reset_at < self._reset_cooldown:
+                logging.debug("[%s] reset skipped due to cooldown", self._label)
+                return
+            # 可能别的协程已经重建过了，再检查一次
+            if self._consecutive_failures < self._max_failures:
+                return
+            logging.error(
+                "[%s] rebuilding httpx client after %d consecutive failures",
+                self._label,
+                self._consecutive_failures,
+            )
+            try:
+                await self.shutdown()
+            except Exception:
+                logging.exception("[%s] shutdown raised, continuing", self._label)
+            try:
+                await self.initialize()
+            except Exception:
+                logging.exception(
+                    "[%s] initialize raised; client may still be broken", self._label
+                )
+                # 不 raise：让外层的失败重试继续，下一次 failure 累积后还会再试
+                return
+            self._last_reset_at = now
+            self._consecutive_failures = 0
+            logging.info("[%s] httpx client rebuilt successfully", self._label)
 
 T = TypeVar("T")
 def assert_not_none(value: Optional[T], message: str) -> T:
@@ -193,7 +292,37 @@ class DB:
 
 db: DB
 
-app = ApplicationBuilder().token(bot_token).read_timeout(30.).write_timeout(30.).connection_pool_size(512).build()
+# 两个独立的 HTTPXRequest：
+# - get_updates_request 只给长轮询用，池子小（长轮询只需 1 条连接，给 2 条余量以便坏连接被踢出时能立刻顶上）
+# - request 给所有主动 API 调用用，池子大以支撑媒体并发
+_get_updates_request = ResilientHTTPXRequest(
+    connection_pool_size=2,
+    connect_timeout=15.0,
+    read_timeout=35.0,
+    write_timeout=15.0,
+    pool_timeout=3.0,
+    label="get_updates",
+    max_consecutive_failures=5,
+    reset_cooldown=30.0,
+)
+_main_request = ResilientHTTPXRequest(
+    connection_pool_size=256,
+    connect_timeout=15.0,
+    read_timeout=30.0,
+    write_timeout=30.0,
+    pool_timeout=3.0,
+    label="request",
+    max_consecutive_failures=10,
+    reset_cooldown=30.0,
+)
+
+app = (
+    ApplicationBuilder()
+    .token(bot_token)
+    .get_updates_request(_get_updates_request)
+    .request(_main_request)
+    .build()
+)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1261,12 +1390,47 @@ app.add_handlers(
 )
 app.add_error_handler(error_handler)
 
+
+# 兜底 Watchdog：如果 ResilientHTTPXRequest 已经尝试过重建但仍持续失败 WATCHDOG_EXIT_AFTER 秒，
+# 就直接退出进程，交给 systemd 重启（bot.service 需要设置 Restart=on-failure）。
+# 正常情况下 Layer 1 的自愈就足够了，这里是终极保险。
+WATCHDOG_CHECK_INTERVAL = 60.0
+WATCHDOG_EXIT_AFTER = 600.0  # 10 分钟仍未恢复则重启进程
+
+async def updater_watchdog() -> None:
+    """监控 get_updates_request 的连续失败状况，彻底失联时自杀。"""
+    loop = asyncio.get_event_loop()
+    req = _get_updates_request
+    while True:
+        try:
+            await asyncio.sleep(WATCHDOG_CHECK_INTERVAL)
+            # 如果 consecutive_failures>0 且距离上次重建已经超过阈值，说明重建未生效
+            if req.consecutive_failures >= req._max_failures and (
+                loop.time() - req.last_reset_at > WATCHDOG_EXIT_AFTER
+            ):
+                logging.critical(
+                    "Watchdog: get_updates client still broken after %.0fs "
+                    "(consecutive_failures=%d). Exiting for systemd to restart.",
+                    WATCHDOG_EXIT_AFTER,
+                    req.consecutive_failures,
+                )
+                # 用 os._exit 立即杀进程，避免 asyncio 的清理流程也卡死
+                os._exit(1)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logging.exception("Watchdog loop iteration failed")
+
+
 async def post_init(application: Application) -> None:
     global db
     db = await DB.create(db_path)
     ws_task = asyncio.create_task(websocket_handler())
     _background_tasks.add(ws_task)
     ws_task.add_done_callback(_background_tasks.discard)
+    wd_task = asyncio.create_task(updater_watchdog())
+    _background_tasks.add(wd_task)
+    wd_task.add_done_callback(_background_tasks.discard)
 
 async def post_shutdown(application: Application) -> None:
     await db.close()
